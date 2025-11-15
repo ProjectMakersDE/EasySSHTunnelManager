@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Easy SSH Tunnel Manager
+Comment=Manage SSH tunnels with a simple GUI
+Exec=/usr/local/bin/easy_ssh_tunnel.py
+Icon=/usr/local/share/easy-ssh-tunnel/icons/logo.png
+Terminal=false
+Categories=Network;System;
+Keywords=ssh;tunnel;port-forwarding;
+StartupWMClass=easy-ssh-tunnel
