@@ -27,25 +27,55 @@ class SSHTunnelManager:
             return False, "Tunnel already running"
 
         tunnel_type = config.get('type', 'local')
-        local_port = config.get('local_port', '')
-        remote_host = config.get('remote_host', '')
-        remote_port = config.get('remote_port', '')
         ssh_host = config.get('ssh_host', '')
         ssh_user = config.get('ssh_user', '')
         ssh_port = config.get('ssh_port', '22')
 
         # Build SSH command
+        cmd = ['ssh', '-N']
+
         if tunnel_type == 'local':
             # Local port forwarding: -L local_port:remote_host:remote_port
-            tunnel_spec = f"{local_port}:{remote_host}:{remote_port}"
-            cmd = ['ssh', '-N', '-L', tunnel_spec]
+            # Support both single port forward and multiple port forwards
+            forwards = config.get('forwards', [])
+            if forwards:
+                # Multiple port forwards
+                for forward in forwards:
+                    local_port = forward.get('local_port', '')
+                    remote_host = forward.get('remote_host', '')
+                    remote_port = forward.get('remote_port', '')
+                    tunnel_spec = f"{local_port}:{remote_host}:{remote_port}"
+                    cmd.extend(['-L', tunnel_spec])
+            else:
+                # Legacy single port forward (backward compatibility)
+                local_port = config.get('local_port', '')
+                remote_host = config.get('remote_host', '')
+                remote_port = config.get('remote_port', '')
+                tunnel_spec = f"{local_port}:{remote_host}:{remote_port}"
+                cmd.extend(['-L', tunnel_spec])
         elif tunnel_type == 'remote':
-            # Remote port forwarding: -R remote_port:local_host:local_port
-            tunnel_spec = f"{remote_port}:{remote_host}:{local_port}"
-            cmd = ['ssh', '-N', '-R', tunnel_spec]
+            # Remote port forwarding: -R remote_port:remote_host:local_port
+            # Support both single and multiple port forwards
+            forwards = config.get('forwards', [])
+            if forwards:
+                # Multiple port forwards
+                for forward in forwards:
+                    remote_port = forward.get('remote_port', '')
+                    remote_host = forward.get('remote_host', '')
+                    local_port = forward.get('local_port', '')
+                    tunnel_spec = f"{remote_port}:{remote_host}:{local_port}"
+                    cmd.extend(['-R', tunnel_spec])
+            else:
+                # Legacy single port forward (backward compatibility)
+                local_port = config.get('local_port', '')
+                remote_host = config.get('remote_host', '')
+                remote_port = config.get('remote_port', '')
+                tunnel_spec = f"{remote_port}:{remote_host}:{local_port}"
+                cmd.extend(['-R', tunnel_spec])
         else:  # dynamic
             # Dynamic port forwarding (SOCKS proxy): -D local_port
-            cmd = ['ssh', '-N', '-D', local_port]
+            local_port = config.get('local_port', '')
+            cmd.extend(['-D', local_port])
 
         # Add SSH connection details
         cmd.extend(['-p', ssh_port, f"{ssh_user}@{ssh_host}"])
@@ -122,11 +152,12 @@ class SSHCommandParser:
         Parse an SSH command and extract tunnel configuration.
         Supports formats like:
         - ssh -L 8080:localhost:80 user@host
+        - ssh -L 27017:mongodb-0:27017 -L 27018:mongodb-1:27017 user@host
         - ssh -R 9090:localhost:8080 -p 2222 user@host
         - ssh -D 1080 user@host
         """
-        # Remove leading/trailing whitespace
-        command = command.strip()
+        # Remove leading/trailing whitespace and normalize whitespace
+        command = ' '.join(command.split())
 
         # Basic validation - must start with ssh
         if not command.startswith('ssh'):
@@ -141,24 +172,51 @@ class SSHCommandParser:
             'remote_port': '',
             'ssh_user': '',
             'ssh_host': '',
-            'name': ''
+            'name': '',
+            'forwards': []
         }
 
-        # Parse -L (local forwarding)
-        local_match = re.search(r'-L\s+(\d+):([^:]+):(\d+)', command)
-        if local_match:
+        # Parse all -L (local forwarding) flags
+        local_matches = re.findall(r'-L\s+(\d+):([^:\s]+):(\d+)', command)
+        if local_matches:
             config['type'] = 'local'
-            config['local_port'] = local_match.group(1)
-            config['remote_host'] = local_match.group(2)
-            config['remote_port'] = local_match.group(3)
+            if len(local_matches) == 1:
+                # Single forward - use legacy format for backward compatibility
+                config['local_port'] = local_matches[0][0]
+                config['remote_host'] = local_matches[0][1]
+                config['remote_port'] = local_matches[0][2]
+            else:
+                # Multiple forwards - use new format
+                config['forwards'] = []
+                for match in local_matches:
+                    config['forwards'].append({
+                        'local_port': match[0],
+                        'remote_host': match[1],
+                        'remote_port': match[2]
+                    })
+                # Set first forward's local_port for display purposes
+                config['local_port'] = local_matches[0][0]
 
-        # Parse -R (remote forwarding)
-        remote_match = re.search(r'-R\s+(\d+):([^:]+):(\d+)', command)
-        if remote_match:
+        # Parse all -R (remote forwarding) flags
+        remote_matches = re.findall(r'-R\s+(\d+):([^:\s]+):(\d+)', command)
+        if remote_matches:
             config['type'] = 'remote'
-            config['remote_port'] = remote_match.group(1)
-            config['remote_host'] = remote_match.group(2)
-            config['local_port'] = remote_match.group(3)
+            if len(remote_matches) == 1:
+                # Single forward - use legacy format for backward compatibility
+                config['remote_port'] = remote_matches[0][0]
+                config['remote_host'] = remote_matches[0][1]
+                config['local_port'] = remote_matches[0][2]
+            else:
+                # Multiple forwards - use new format
+                config['forwards'] = []
+                for match in remote_matches:
+                    config['forwards'].append({
+                        'remote_port': match[0],
+                        'remote_host': match[1],
+                        'local_port': match[2]
+                    })
+                # Set first forward's remote_port for display purposes
+                config['remote_port'] = remote_matches[0][0]
 
         # Parse -D (dynamic forwarding)
         dynamic_match = re.search(r'-D\s+(\d+)', command)
@@ -182,9 +240,17 @@ class SSHCommandParser:
 
         # Generate a default name
         if config['type'] == 'local':
-            config['name'] = f"{config['ssh_host']}_L{config['local_port']}"
+            if config.get('forwards'):
+                # Multiple forwards - show count in name
+                config['name'] = f"{config['ssh_host']}_L{len(config['forwards'])}x"
+            else:
+                config['name'] = f"{config['ssh_host']}_L{config['local_port']}"
         elif config['type'] == 'remote':
-            config['name'] = f"{config['ssh_host']}_R{config['remote_port']}"
+            if config.get('forwards'):
+                # Multiple forwards - show count in name
+                config['name'] = f"{config['ssh_host']}_R{len(config['forwards'])}x"
+            else:
+                config['name'] = f"{config['ssh_host']}_R{config['remote_port']}"
         else:  # dynamic
             config['name'] = f"{config['ssh_host']}_D{config['local_port']}"
 
@@ -196,22 +262,50 @@ class SSHCommandParser:
         Convert a tunnel configuration to an SSH command line.
         """
         tunnel_type = config.get('type', 'local')
-        local_port = config.get('local_port', '')
-        remote_host = config.get('remote_host', 'localhost')
-        remote_port = config.get('remote_port', '')
         ssh_host = config.get('ssh_host', '')
         ssh_user = config.get('ssh_user', '')
         ssh_port = config.get('ssh_port', '22')
 
         # Build SSH command
+        cmd = "ssh -N"
+
         if tunnel_type == 'local':
-            tunnel_spec = f"{local_port}:{remote_host}:{remote_port}"
-            cmd = f"ssh -N -L {tunnel_spec}"
+            forwards = config.get('forwards', [])
+            if forwards:
+                # Multiple port forwards
+                for forward in forwards:
+                    local_port = forward.get('local_port', '')
+                    remote_host = forward.get('remote_host', 'localhost')
+                    remote_port = forward.get('remote_port', '')
+                    tunnel_spec = f"{local_port}:{remote_host}:{remote_port}"
+                    cmd += f" -L {tunnel_spec}"
+            else:
+                # Legacy single port forward
+                local_port = config.get('local_port', '')
+                remote_host = config.get('remote_host', 'localhost')
+                remote_port = config.get('remote_port', '')
+                tunnel_spec = f"{local_port}:{remote_host}:{remote_port}"
+                cmd += f" -L {tunnel_spec}"
         elif tunnel_type == 'remote':
-            tunnel_spec = f"{remote_port}:{remote_host}:{local_port}"
-            cmd = f"ssh -N -R {tunnel_spec}"
+            forwards = config.get('forwards', [])
+            if forwards:
+                # Multiple port forwards
+                for forward in forwards:
+                    remote_port = forward.get('remote_port', '')
+                    remote_host = forward.get('remote_host', 'localhost')
+                    local_port = forward.get('local_port', '')
+                    tunnel_spec = f"{remote_port}:{remote_host}:{local_port}"
+                    cmd += f" -R {tunnel_spec}"
+            else:
+                # Legacy single port forward
+                local_port = config.get('local_port', '')
+                remote_host = config.get('remote_host', 'localhost')
+                remote_port = config.get('remote_port', '')
+                tunnel_spec = f"{remote_port}:{remote_host}:{local_port}"
+                cmd += f" -R {tunnel_spec}"
         else:  # dynamic
-            cmd = f"ssh -N -D {local_port}"
+            local_port = config.get('local_port', '')
+            cmd += f" -D {local_port}"
 
         # Add SSH connection details
         if ssh_port != '22':
@@ -306,7 +400,16 @@ class TunnelDialog(Gtk.Dialog):
 
         box.pack_start(self.tunnel_grid, False, False, 0)
 
+        # Multi-forward info label (shown when editing tunnels with multiple forwards)
+        self.multi_forward_label = Gtk.Label()
+        self.multi_forward_label.set_markup("<b>Note:</b> This tunnel has multiple port forwards.\nTo edit them, delete this tunnel and re-import the SSH command.")
+        self.multi_forward_label.set_xalign(0)
+        self.multi_forward_label.set_line_wrap(True)
+        self.multi_forward_label.set_no_show_all(True)
+        box.pack_start(self.multi_forward_label, False, False, 6)
+
         # Load existing data if editing
+        self.tunnel_data = tunnel_data
         if tunnel_data:
             self.load_data(tunnel_data)
 
@@ -354,9 +457,19 @@ class TunnelDialog(Gtk.Dialog):
         self.remote_host_entry.set_text(data.get('remote_host', ''))
         self.remote_port_entry.set_text(data.get('remote_port', ''))
 
+        # Check if this has multiple forwards
+        forwards = data.get('forwards', [])
+        if forwards and len(forwards) > 0:
+            # Show the multi-forward info label
+            self.multi_forward_label.show()
+            # Make fields read-only to prevent confusion
+            self.local_port_entry.set_editable(False)
+            self.remote_host_entry.set_editable(False)
+            self.remote_port_entry.set_editable(False)
+
     def get_data(self):
         """Get tunnel data from the form"""
-        return {
+        data = {
             'name': self.name_entry.get_text(),
             'type': self.type_combo.get_active_id(),
             'ssh_user': self.ssh_user_entry.get_text(),
@@ -366,6 +479,12 @@ class TunnelDialog(Gtk.Dialog):
             'remote_host': self.remote_host_entry.get_text(),
             'remote_port': self.remote_port_entry.get_text(),
         }
+
+        # Preserve forwards if they exist in the original data
+        if self.tunnel_data and 'forwards' in self.tunnel_data:
+            data['forwards'] = self.tunnel_data['forwards']
+
+        return data
 
 
 class EasySSHTunnelApp(Gtk.Window):
@@ -377,12 +496,15 @@ class EasySSHTunnelApp(Gtk.Window):
         self.set_border_width(10)
 
         # Set window properties for taskbar appearance
-        # Note: set_wmclass is deprecated but still works in GTK3
+        # Note: set_wmclass is deprecated in GTK3 but may still be useful for some window managers
         # It helps window managers group windows correctly
-        try:
-            self.set_wmclass("easy-ssh-tunnel", "Easy SSH Tunnel Manager")
-        except:
-            pass
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            try:
+                self.set_wmclass("easy-ssh-tunnel", "Easy SSH Tunnel Manager")
+            except:
+                pass
 
         # Set window type hint to NORMAL to ensure taskbar visibility
         self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
@@ -542,7 +664,15 @@ class EasySSHTunnelApp(Gtk.Window):
         for config in self.tunnels_config:
             tunnel_type = config.get('type', 'local').capitalize()
             ssh_host = f"{config.get('ssh_user')}@{config.get('ssh_host')}"
-            local_port = config.get('local_port', '-')
+
+            # Handle multiple forwards
+            forwards = config.get('forwards', [])
+            if forwards and len(forwards) > 0:
+                # Show first local port + count
+                local_port = f"{forwards[0].get('local_port', '-')} (+{len(forwards)-1})"
+            else:
+                local_port = config.get('local_port', '-')
+
             status = "Running" if self.tunnel_manager.is_running(config.get('name')) else "Stopped"
 
             self.tunnel_store.append([
@@ -699,7 +829,7 @@ class EasySSHTunnelApp(Gtk.Window):
         box.set_margin_start(12)
         box.set_margin_end(12)
 
-        label = Gtk.Label(label="Paste SSH commands (one per line, comment above command becomes tunnel name):")
+        label = Gtk.Label(label="Paste SSH commands (supports multiline with \\ or indentation):")
         label.set_xalign(0)
         box.pack_start(label, False, False, 0)
 
@@ -714,7 +844,7 @@ class EasySSHTunnelApp(Gtk.Window):
 
         # Example text
         example_label = Gtk.Label()
-        example_label.set_markup("<small><i>Example:\n# My Web Tunnel\nssh -L 8080:localhost:80 user@host\n# SOCKS Proxy\nssh -D 1080 user@proxy</i></small>")
+        example_label.set_markup("<small><i>Examples:\n# Single tunnel\nssh -L 8080:localhost:80 user@host\n# Multiple forwards\nssh -L 27017:mongo-0:27017 \\\n    -L 27018:mongo-1:27017 -p 4022 user@host</i></small>")
         example_label.set_xalign(0)
         box.pack_start(example_label, False, False, 0)
 
@@ -728,8 +858,12 @@ class EasySSHTunnelApp(Gtk.Window):
             input_text = text_buffer.get_text(start_iter, end_iter, False).strip()
 
             if input_text:
+                # Pre-process to handle multiline commands with backslash continuation
+                # Replace backslash-newline with space
+                processed_text = input_text.replace('\\\n', ' ')
+
                 # Split by lines and process each command
-                lines = input_text.split('\n')
+                lines = processed_text.split('\n')
                 imported_count = 0
                 failed_count = 0
                 error_messages = []
@@ -737,6 +871,10 @@ class EasySSHTunnelApp(Gtk.Window):
 
                 # Track the last comment to use as tunnel name
                 pending_name = None
+
+                # Track lines that are part of a multiline command (without backslash)
+                current_command = []
+                command_start_line = 0
 
                 for line_num, line in enumerate(lines, 1):
                     line = line.strip()
@@ -747,15 +885,74 @@ class EasySSHTunnelApp(Gtk.Window):
 
                     # Check if this is a comment line
                     if line.startswith('#'):
+                        # If we have a pending multiline command, process it first
+                        if current_command:
+                            full_command = ' '.join(current_command)
+                            try:
+                                config = SSHCommandParser.parse_ssh_command(full_command)
+                                if pending_name:
+                                    config['name'] = pending_name
+                                if config['name'] in existing_names:
+                                    counter = 1
+                                    base_name = config['name']
+                                    while f"{base_name}_{counter}" in existing_names:
+                                        counter += 1
+                                    config['name'] = f"{base_name}_{counter}"
+                                existing_names.append(config['name'])
+                                self.tunnels_config.append(config)
+                                imported_count += 1
+                            except Exception as e:
+                                failed_count += 1
+                                error_messages.append(f"Line {command_start_line}: {str(e)}")
+                            current_command = []
+                            pending_name = None
+
                         # Extract the name from the comment (remove # and whitespace)
                         comment_text = line[1:].strip()
                         if comment_text:
                             pending_name = comment_text
                         continue
 
+                    # Check if this is the start of a new SSH command
+                    if line.startswith('ssh'):
+                        # If we have a pending multiline command, process it first
+                        if current_command:
+                            full_command = ' '.join(current_command)
+                            try:
+                                config = SSHCommandParser.parse_ssh_command(full_command)
+                                if pending_name:
+                                    config['name'] = pending_name
+                                if config['name'] in existing_names:
+                                    counter = 1
+                                    base_name = config['name']
+                                    while f"{base_name}_{counter}" in existing_names:
+                                        counter += 1
+                                    config['name'] = f"{base_name}_{counter}"
+                                existing_names.append(config['name'])
+                                self.tunnels_config.append(config)
+                                imported_count += 1
+                            except Exception as e:
+                                failed_count += 1
+                                error_messages.append(f"Line {command_start_line}: {str(e)}")
+                            pending_name = None
+
+                        # Start new command
+                        current_command = [line]
+                        command_start_line = line_num
+                    elif current_command:
+                        # This is a continuation line (doesn't start with ssh)
+                        current_command.append(line)
+                    else:
+                        # Orphaned line that doesn't start with ssh and no current command
+                        failed_count += 1
+                        error_messages.append(f"Line {line_num}: Command must start with 'ssh'")
+
+                # Process the last command if any
+                if current_command:
+                    full_command = ' '.join(current_command)
                     try:
                         # Parse the SSH command
-                        config = SSHCommandParser.parse_ssh_command(line)
+                        config = SSHCommandParser.parse_ssh_command(full_command)
 
                         # Use the pending name from comment if available
                         if pending_name:
