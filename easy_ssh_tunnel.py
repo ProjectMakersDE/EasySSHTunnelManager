@@ -546,6 +546,7 @@ class EasySSHTunnelApp(Gtk.Window):
         self.tunnel_manager = tunnel_manager or SSHTunnelManager()
         self.config_manager = config_manager or ConfigManager()
         self.tunnels_config = self.config_manager.load_tunnels()
+        self._install_manage_tunnel_css()
 
         # Main layout
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -554,42 +555,63 @@ class EasySSHTunnelApp(Gtk.Window):
         # Toolbar
         toolbar = Gtk.Toolbar()
         toolbar.get_style_context().add_class(Gtk.STYLE_CLASS_PRIMARY_TOOLBAR)
+        toolbar.get_style_context().add_class("manage-tunnel-toolbar")
+        toolbar.set_style(Gtk.ToolbarStyle.BOTH_HORIZ)
+        toolbar.set_icon_size(Gtk.IconSize.SMALL_TOOLBAR)
+        toolbar.set_show_arrow(False)
 
-        add_button = Gtk.ToolButton(stock_id=Gtk.STOCK_ADD)
+        add_button = Gtk.ToolButton()
+        add_button.set_label("Hinzufügen")
+        add_button.set_icon_widget(self._create_toolbar_icon("list-add-symbolic"))
+        self._style_toolbar_button(add_button, "toolbar-button-neutral")
         add_button.connect("clicked", self.on_add_tunnel)
         toolbar.insert(add_button, 0)
 
-        edit_button = Gtk.ToolButton(stock_id=Gtk.STOCK_EDIT)
+        edit_button = Gtk.ToolButton()
+        edit_button.set_label("Bearbeiten")
+        edit_button.set_icon_widget(self._create_toolbar_icon("document-edit-symbolic"))
+        self._style_toolbar_button(edit_button, "toolbar-button-neutral")
         edit_button.connect("clicked", self.on_edit_tunnel)
         toolbar.insert(edit_button, 1)
 
-        remove_button = Gtk.ToolButton(stock_id=Gtk.STOCK_REMOVE)
+        remove_button = Gtk.ToolButton()
+        remove_button.set_label("Entfernen")
+        remove_button.set_icon_widget(self._create_toolbar_icon("user-trash-symbolic"))
+        self._style_toolbar_button(remove_button, "toolbar-button-danger")
         remove_button.connect("clicked", self.on_remove_tunnel)
         toolbar.insert(remove_button, 2)
 
         toolbar.insert(Gtk.SeparatorToolItem(), 3)
 
-        start_button = Gtk.ToolButton(stock_id=Gtk.STOCK_MEDIA_PLAY)
+        start_button = Gtk.ToolButton()
         start_button.set_label("Start")
+        start_button.set_icon_widget(self._create_toolbar_icon("media-playback-start-symbolic"))
+        self._style_toolbar_button(start_button, "toolbar-button-success")
         start_button.connect("clicked", self.on_start_tunnel)
         toolbar.insert(start_button, 4)
 
-        stop_button = Gtk.ToolButton(stock_id=Gtk.STOCK_MEDIA_STOP)
+        stop_button = Gtk.ToolButton()
         stop_button.set_label("Stop")
+        stop_button.set_icon_widget(self._create_toolbar_icon("media-playback-stop-symbolic"))
+        self._style_toolbar_button(stop_button, "toolbar-button-danger")
         stop_button.connect("clicked", self.on_stop_tunnel)
         toolbar.insert(stop_button, 5)
 
         toolbar.insert(Gtk.SeparatorToolItem(), 6)
 
-        import_button = Gtk.ToolButton(stock_id=Gtk.STOCK_OPEN)
+        import_button = Gtk.ToolButton()
         import_button.set_label("Import")
+        import_button.set_icon_widget(self._create_toolbar_icon("document-open-symbolic"))
         import_button.set_tooltip_text("Import SSH command")
+        self._style_toolbar_button(import_button, "toolbar-button-neutral")
         import_button.connect("clicked", self.on_import_command)
         toolbar.insert(import_button, 7)
 
-        export_button = Gtk.ToolButton(stock_id=Gtk.STOCK_SAVE_AS)
+        export_button = Gtk.ToolButton()
         export_button.set_label("Export")
+        export_button.set_icon_widget(self._create_toolbar_icon("document-save-symbolic"))
         export_button.set_tooltip_text("Export all tunnels as SSH commands")
+        self._style_toolbar_button(export_button, "toolbar-button-neutral")
         export_button.connect("clicked", self.on_export_commands)
         toolbar.insert(export_button, 8)
 
@@ -648,6 +670,114 @@ class EasySSHTunnelApp(Gtk.Window):
 
         # Handle window close to hide instead of quit (when running with indicator)
         self.connect("delete-event", self.on_window_delete)
+
+    def _install_manage_tunnel_css(self):
+        """Install explicit toolbar button styling for reliable contrast."""
+        css = b"""
+        toolbar.manage-tunnel-toolbar {
+            background: #2b2b2b;
+            border: none;
+            border-radius: 0;
+            padding: 0;
+            box-shadow: none;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton button {
+            color: #e8e8e8;
+            border-radius: 0;
+            border: 1px solid #4a4a4a;
+            padding: 6px 14px;
+            min-height: 34px;
+            background-image: none;
+            text-shadow: none;
+            box-shadow: none;
+            margin-right: 6px;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton button image,
+        toolbar.manage-tunnel-toolbar toolbutton button label {
+            color: inherit;
+        }
+
+        toolbar.manage-tunnel-toolbar image.toolbar-button-icon {
+            color: #f1f3f5;
+            opacity: 0.92;
+        }
+
+        toolbar.manage-tunnel-toolbar separator {
+            min-width: 8px;
+            border: none;
+            background: transparent;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-neutral button {
+            background: #3c4657;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-neutral button:hover {
+            background: #465062;
+            border-color: #5b6678;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-success button {
+            background: #365246;
+            border-color: #49685b;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-success button:hover {
+            background: #406052;
+            border-color: #55776a;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-danger button {
+            background: #5a3c40;
+            border-color: #734c51;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-danger button:hover {
+            background: #694549;
+            border-color: #83565c;
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton button:checked,
+        toolbar.manage-tunnel-toolbar toolbutton button:active {
+            background-image: none;
+            box-shadow: inset 0 1px 2px alpha(black, 0.24);
+        }
+
+        toolbar.manage-tunnel-toolbar toolbutton:last-child button {
+            margin-right: 0;
+        }
+        """
+        provider = Gtk.CssProvider()
+        try:
+            provider.load_from_data(css)
+        except GLib.Error as error:
+            print(f"Could not load toolbar CSS: {error}")
+            return
+
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen,
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+    def _style_toolbar_button(self, button, variant_class):
+        """Add button classes and force labels to stay visible."""
+        button.set_is_important(True)
+        button.get_style_context().add_class(variant_class)
+        icon_widget = button.get_icon_widget()
+        if icon_widget is not None:
+            icon_widget.get_style_context().add_class("toolbar-button-icon")
+
+    def _create_toolbar_icon(self, icon_name):
+        """Create a consistently sized symbolic icon for toolbar buttons."""
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.MENU)
+        icon.set_pixel_size(16)
+        icon.get_style_context().add_class("toolbar-button-icon")
+        return icon
 
     def on_window_delete(self, widget, event):
         """Handle window close - hide instead of quit when using indicator"""
