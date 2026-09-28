@@ -8,23 +8,23 @@ You can import SSH commands with multiple `-L` or `-R` flags in various formats:
 
 **With backslash line continuation:**
 ```bash
-ssh -N -L 27017:mongodb-0.mongodb.database.svc.cluster.local:27017 \
-         -L 27018:mongodb-1.mongodb.database.svc.cluster.local:27017 \
-         -L 27019:mongodb-2.mongodb.database.svc.cluster.local:27017 \
-         -p 4022 horizon@46.62.220.204
+ssh -N -L 27017:db-0.internal:27017 \
+         -L 27018:db-1.internal:27017 \
+         -L 27019:db-2.internal:27017 \
+         -p 2222 deploy@db-gateway.example.com
 ```
 
 **Multiline without backslash (indented continuation):**
 ```bash
-ssh -N -L 27017:mongodb-0.mongodb.database.svc.cluster.local:27017
-         -L 27018:mongodb-1.mongodb.database.svc.cluster.local:27017
-         -L 27019:mongodb-2.mongodb.database.svc.cluster.local:27017
-         -p 4022 horizon@46.62.220.204
+ssh -N -L 27017:db-0.internal:27017
+         -L 27018:db-1.internal:27017
+         -L 27019:db-2.internal:27017
+         -p 2222 deploy@db-gateway.example.com
 ```
 
 **Single line:**
 ```bash
-ssh -N -L 27017:mongodb-0.mongodb.database.svc.cluster.local:27017 -L 27018:mongodb-1.mongodb.database.svc.cluster.local:27017 -L 27019:mongodb-2.mongodb.database.svc.cluster.local:27017 -p 4022 horizon@46.62.220.204
+ssh -N -L 27017:db-0.internal:27017 -L 27018:db-1.internal:27017 -L 27019:db-2.internal:27017 -p 2222 deploy@db-gateway.example.com
 ```
 
 All three formats are supported!
@@ -35,7 +35,7 @@ All three formats are supported!
 2. Paste your SSH command with multiple `-L` or `-R` flags
 3. Click OK
 
-The tunnel will be created with all port forwards configured. The tunnel name will show the number of forwards (e.g., `46.62.220.204_L3x` for 3 local forwards).
+The tunnel will be created with all port forwards configured. The tunnel name will show the number of forwards (e.g., `db-gateway.example.com_L3x` for 3 local forwards).
 
 ## Features
 
@@ -58,23 +58,23 @@ The application stores multiple forwards in a `forwards` array in the tunnel con
 {
   "name": "example_L3x",
   "type": "local",
-  "ssh_user": "horizon",
-  "ssh_host": "46.62.220.204",
-  "ssh_port": "4022",
+  "ssh_user": "deploy",
+  "ssh_host": "db-gateway.example.com",
+  "ssh_port": "2222",
   "forwards": [
     {
       "local_port": "27017",
-      "remote_host": "mongodb-0.mongodb.database.svc.cluster.local",
+      "remote_host": "db-0.internal",
       "remote_port": "27017"
     },
     {
       "local_port": "27018",
-      "remote_host": "mongodb-1.mongodb.database.svc.cluster.local",
+      "remote_host": "db-1.internal",
       "remote_port": "27017"
     },
     {
       "local_port": "27019",
-      "remote_host": "mongodb-2.mongodb.database.svc.cluster.local",
+      "remote_host": "db-2.internal",
       "remote_port": "27017"
     }
   ]

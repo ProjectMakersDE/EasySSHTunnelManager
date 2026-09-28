@@ -974,7 +974,7 @@ class EasySSHTunnelApp(Gtk.Window):
 
         # Example text
         example_label = Gtk.Label()
-        example_label.set_markup("<small><i>Examples:\n# Single tunnel\nssh -L 8080:localhost:80 user@host\n# Multiple forwards\nssh -L 27017:mongo-0:27017 \\\n    -L 27018:mongo-1:27017 -p 4022 user@host</i></small>")
+        example_label.set_markup("<small><i>Examples:\n# Single tunnel\nssh -L 8080:localhost:80 user@host\n# Multiple forwards\nssh -L 27017:mongo-0:27017 \\\n    -L 27018:mongo-1:27017 -p 2222 user@host</i></small>")
         example_label.set_xalign(0)
         box.pack_start(example_label, False, False, 0)
 
