@@ -30,10 +30,6 @@ else
     echo "AppIndicator3 is installed."
 fi
 
-# Generate icons
-echo "Generating tray icons..."
-python3 create_icons.py
-
 # Copy script to /usr/local/bin
 echo "Installing application..."
 cp easy_ssh_tunnel.py /usr/local/bin/

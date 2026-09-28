@@ -68,8 +68,9 @@
 ### Quick Setup (Ubuntu/Debian)
 
 ```bash
-# Clone or navigate to the project directory
-cd ~/Dokumente/GitHub/easySSHTunnel
+# Clone the repository
+git clone https://github.com/ProjectMakersDE/EasySSHTunnelManager.git
+cd EasySSHTunnelManager
 
 # Install system dependencies
 sudo apt-get update
@@ -89,7 +90,7 @@ The application will start in system tray mode. Look for the network server icon
 For system-wide installation and desktop menu integration:
 
 ```bash
-cd ~/Dokumente/GitHub/easySSHTunnel
+cd EasySSHTunnelManager
 sudo ./install.sh
 ```
 
@@ -106,7 +107,7 @@ After installation, you can launch it from the Gnome applications menu or add it
 If you're updating from a previous version:
 
 ```bash
-cd ~/Dokumente/GitHub/easySSHTunnel
+cd EasySSHTunnelManager
 
 # Pull latest changes (if using git)
 git pull
@@ -243,7 +244,7 @@ To start the application automatically when you log in:
    - **Comment**: Manage SSH tunnels from system tray
 4. Click "Add"
 
-The application will now start in the system tray on login and automatically restore previously running tunnels.
+The application will now start in the system tray on login.
 
 ## Troubleshooting
 
@@ -302,5 +303,5 @@ If you find this project useful, please consider:
 ## Acknowledgments
 
 - Built with [GTK3](https://www.gtk.org/) and [PyGObject](https://pygobject.readthedocs.io/)
-- System tray integration powered by [AppIndicator3](https://lazka.github.io/pgi-docs/AppIndicator3-0.1/index.html)
+- System tray integration powered by [AppIndicator3](https://lazka.github.io/pgi-docs/#AppIndicator3-0.1)
 - Inspired by the need for a simple, user-friendly SSH tunnel manager on Linux
