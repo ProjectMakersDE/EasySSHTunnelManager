@@ -40,8 +40,20 @@ COLOR_GREY = "#6e7180"
 # Statuses that mean the port is open; the row switch shows these as ON
 ON_STATUSES = ("Running", "Connecting", "External")
 
+# Default colors handed out to tunnels without one
+TUNNEL_PALETTE = ["#7eb26d", "#eab839", "#6ed0e0", "#ef843c",
+                  "#e24d42", "#1f78c1", "#ba43a9", "#705da0"]
+
+HEX_RE = re.compile(r'^#?([0-9a-fA-F]{6})$')
+
 # ssh options that take a value, needed to find the destination in a command line
 SSH_OPTS_WITH_ARG = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def normalize_hex(value):
+    """Return '#rrggbb' for a valid hex color, else None"""
+    match = HEX_RE.match((value or '').strip())
+    return f"#{match.group(1).lower()}" if match else None
 
 
 def tunnel_port(config):
@@ -379,7 +391,7 @@ class ConfigManager:
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
     def load_tunnels(self):
-        """Load saved tunnel configurations, giving each an id"""
+        """Load saved tunnel configurations, giving each an id and a color"""
         tunnels = []
         if self.config_file.exists():
             try:
@@ -389,9 +401,12 @@ class ConfigManager:
                 print(f"Error loading config: {e}")
                 return []
         changed = False
-        for config in tunnels:
+        for index, config in enumerate(tunnels):
             if not config.get('id'):
                 config['id'] = uuid.uuid4().hex
+                changed = True
+            if not normalize_hex(config.get('color')):
+                config['color'] = TUNNEL_PALETTE[index % len(TUNNEL_PALETTE)]
                 changed = True
         if changed:
             self.save_tunnels(tunnels)
@@ -409,8 +424,9 @@ class ConfigManager:
 
     @staticmethod
     def new_tunnel_fields(existing):
-        """Fields a tunnel being added needs"""
-        return {'id': uuid.uuid4().hex}
+        """id and next palette color for a tunnel being added"""
+        return {'id': uuid.uuid4().hex,
+                'color': TUNNEL_PALETTE[len(existing) % len(TUNNEL_PALETTE)]}
 
 
 def terminal_command():
@@ -426,6 +442,18 @@ def terminal_command():
     except (OSError, subprocess.SubprocessError):
         pass
     return ['gnome-terminal', '--']
+
+
+def color_dot_pixbuf(hex_color, size=16):
+    """Round color swatch for menus"""
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    ctx = cairo.Context(surface)
+    rgba = Gdk.RGBA()
+    rgba.parse(normalize_hex(hex_color) or COLOR_DIM)
+    ctx.set_source_rgba(rgba.red, rgba.green, rgba.blue, 1.0)
+    ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 6.2832)
+    ctx.fill()
+    return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
 
 class SSHCommandParser:
@@ -686,6 +714,21 @@ class TunnelDialog(Gtk.Dialog):
         self.name_entry = Gtk.Entry()
         box.pack_start(self.name_entry, False, False, 0)
 
+        # Tunnel color: picker and hex entry kept in sync
+        box.pack_start(Gtk.Label(label="Color:", xalign=0), False, False, 6)
+        color_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.color_button = Gtk.ColorButton()
+        self.color_button.set_use_alpha(False)
+        self.color_button.connect("color-set", self.on_color_picked)
+        color_box.pack_start(self.color_button, False, False, 0)
+        self.color_entry = Gtk.Entry()
+        self.color_entry.set_placeholder_text("#7eb26d")
+        self.color_entry.set_width_chars(10)
+        self.color_entry.connect("changed", self.on_color_typed)
+        color_box.pack_start(self.color_entry, False, False, 0)
+        box.pack_start(color_box, False, False, 0)
+        self.set_color(TUNNEL_PALETTE[0])
+
         # Tunnel type
         box.pack_start(Gtk.Label(label="Tunnel Type:", xalign=0), False, False, 6)
         self.type_combo = Gtk.ComboBoxText()
@@ -793,9 +836,31 @@ class TunnelDialog(Gtk.Dialog):
             self.remote_port_label.hide()
             self.remote_port_entry.hide()
 
+    def set_color(self, hex_color):
+        self.color_entry.set_text(hex_color)
+        self.on_color_typed(self.color_entry)
+
+    def on_color_picked(self, button):
+        rgba = button.get_rgba()
+        hex_color = "#{:02x}{:02x}{:02x}".format(
+            round(rgba.red * 255), round(rgba.green * 255), round(rgba.blue * 255))
+        if normalize_hex(self.color_entry.get_text()) != hex_color:
+            self.color_entry.set_text(hex_color)
+
+    def on_color_typed(self, entry):
+        hex_color = normalize_hex(entry.get_text())
+        entry.get_style_context().remove_class("error")
+        if not hex_color:
+            entry.get_style_context().add_class("error")
+            return
+        rgba = Gdk.RGBA()
+        rgba.parse(hex_color)
+        self.color_button.set_rgba(rgba)
+
     def load_data(self, data):
         """Load tunnel data into the form"""
         self.name_entry.set_text(data.get('name', ''))
+        self.set_color(normalize_hex(data.get('color')) or TUNNEL_PALETTE[0])
         self.type_combo.set_active_id(data.get('type', 'local'))
         self.ssh_user_entry.set_text(data.get('ssh_user', ''))
         self.ssh_host_entry.set_text(data.get('ssh_host', ''))
@@ -825,6 +890,7 @@ class TunnelDialog(Gtk.Dialog):
             'local_port': self.local_port_entry.get_text(),
             'remote_host': self.remote_host_entry.get_text(),
             'remote_port': self.remote_port_entry.get_text(),
+            'color': normalize_hex(self.color_entry.get_text()) or TUNNEL_PALETTE[0],
         }
         for key in ('name', 'ssh_user', 'ssh_host', 'ssh_port', 'local_port',
                     'remote_host', 'remote_port'):
@@ -967,8 +1033,8 @@ class EasySSHTunnelApp(Gtk.Window):
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
         # ListStore: name, type, ssh_host, local_port, status, status_color, message,
-        # config, switch_on
-        self.tunnel_store = Gtk.ListStore(str, str, str, str, str, str, str, object, bool)
+        # config, switch_on, color
+        self.tunnel_store = Gtk.ListStore(str, str, str, str, str, str, str, object, bool, str)
 
         self.tunnel_view = Gtk.TreeView(model=self.tunnel_store)
         self.tunnel_view.get_style_context().add_class("tunnel-list")
@@ -980,10 +1046,20 @@ class EasySSHTunnelApp(Gtk.Window):
         column = Gtk.TreeViewColumn("", renderer, active=8)
         self.tunnel_view.append_column(column)
 
+        renderer = Gtk.CellRendererText()
+        renderer.set_property("text", "●")
+        renderer.set_property("scale", 1.3)
+        column = Gtk.TreeViewColumn("", renderer, foreground=9)
+        self.tunnel_view.append_column(column)
+
         for title, index, min_width in (("Name", 0, 120), ("Type", 1, 70),
                                         ("SSH Host", 2, 150), ("Local Port", 3, 80)):
             renderer = Gtk.CellRendererText()
             column = Gtk.TreeViewColumn(title, renderer, text=index)
+            if title == "Name":
+                # Name in the tunnel's own color
+                column.add_attribute(renderer, "foreground", 9)
+                renderer.set_property("weight", Pango.Weight.BOLD)
             column.set_min_width(min_width)
             column.set_resizable(True)
             self.tunnel_view.append_column(column)
@@ -1023,10 +1099,76 @@ class EasySSHTunnelApp(Gtk.Window):
         self.connect("delete-event", self.on_window_delete)
 
     def _install_manage_tunnel_css(self):
-        """Install explicit toolbar button styling for reliable contrast."""
+        """Dark theme plus toolbar button styling."""
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-application-prefer-dark-theme", True)
         css = b"""
+        @define-color bg_canvas #111217;
+        @define-color bg_primary #181b1f;
+        @define-color bg_secondary #22252b;
+        @define-color border_weak #2c3235;
+        @define-color text_primary #ccccdc;
+        @define-color text_dim #8e8e9a;
+        @define-color accent #ff7f00;
+        @define-color selected_bg #2c3442;
+
+        window, dialog, messagedialog, .background {
+            background-color: @bg_primary;
+            color: @text_primary;
+        }
+
+        treeview.view, textview, textview text {
+            background-color: @bg_canvas;
+            color: @text_primary;
+        }
+
+        treeview.view:selected, treeview.view:selected:focus {
+            background-color: @selected_bg;
+            color: #ffffff;
+        }
+
+        treeview.view header button {
+            background: @bg_secondary;
+            color: @text_dim;
+            border-color: @border_weak;
+            box-shadow: none;
+            text-shadow: none;
+        }
+
+        entry {
+            background: @bg_canvas;
+            color: @text_primary;
+            border-color: @border_weak;
+        }
+
+        entry:focus {
+            border-color: @accent;
+            box-shadow: inset 0 0 0 1px @accent;
+        }
+
+        entry.error {
+            border-color: #f2495c;
+            color: #f2495c;
+        }
+
+        infobar box {
+            background: #1f2a3a;
+            color: @text_primary;
+            border: none;
+        }
+
+        statusbar {
+            background: @bg_secondary;
+            color: @text_dim;
+        }
+
+        scrolledwindow {
+            border: 1px solid @border_weak;
+        }
+
         toolbar.manage-tunnel-toolbar {
-            background: #2b2b2b;
+            background: @bg_primary;
             border: none;
             border-radius: 0;
             padding: 0;
@@ -1035,8 +1177,8 @@ class EasySSHTunnelApp(Gtk.Window):
 
         toolbar.manage-tunnel-toolbar toolbutton button {
             color: #e8e8e8;
-            border-radius: 0;
-            border: 1px solid #4a4a4a;
+            border-radius: 2px;
+            border: 1px solid @border_weak;
             padding: 6px 14px;
             min-height: 34px;
             background-image: none;
@@ -1062,32 +1204,32 @@ class EasySSHTunnelApp(Gtk.Window):
         }
 
         toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-neutral button {
-            background: #3c4657;
+            background: @bg_secondary;
         }
 
         toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-neutral button:hover {
-            background: #465062;
-            border-color: #5b6678;
+            background: #2c3039;
+            border-color: #3d424d;
         }
 
         toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-success button {
-            background: #365246;
-            border-color: #49685b;
+            background: #233127;
+            border-color: #34503b;
         }
 
         toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-success button:hover {
-            background: #406052;
-            border-color: #55776a;
+            background: #2b3d30;
+            border-color: #73bf69;
         }
 
         toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-danger button {
-            background: #5a3c40;
-            border-color: #734c51;
+            background: #36222a;
+            border-color: #57323b;
         }
 
         toolbar.manage-tunnel-toolbar toolbutton.toolbar-button-danger button:hover {
-            background: #694549;
-            border-color: #83565c;
+            background: #432830;
+            border-color: #f2495c;
         }
 
         toolbar.manage-tunnel-toolbar toolbutton button:checked,
@@ -1104,7 +1246,7 @@ class EasySSHTunnelApp(Gtk.Window):
         try:
             provider.load_from_data(css)
         except GLib.Error as error:
-            print(f"Could not load toolbar CSS: {error}")
+            print(f"Could not load CSS: {error}")
             return
 
         screen = Gdk.Screen.get_default()
@@ -1157,7 +1299,8 @@ class EasySSHTunnelApp(Gtk.Window):
                 status_color,
                 message,
                 config,
-                status in ON_STATUSES]
+                status in ON_STATUSES,
+                normalize_hex(config.get('color')) or COLOR_DIM]
 
     def refresh_tunnel_list(self):
         """Refresh the tunnel list view, keeping the selection"""
@@ -1214,6 +1357,8 @@ class EasySSHTunnelApp(Gtk.Window):
     def on_add_tunnel(self, widget, prefill=None):
         """Add a new tunnel configuration"""
         dialog = TunnelDialog(self, prefill)
+        if not prefill or not prefill.get('color'):
+            dialog.set_color(ConfigManager.new_tunnel_fields(self.tunnels_config)['color'])
         response = dialog.run()
 
         if response == Gtk.ResponseType.OK:
@@ -1886,7 +2031,10 @@ class SSHTunnelIndicator:
         if self.tunnels_config:
             for config in self.tunnels_config:
                 _, label_text = self._menu_label(config)
-                menu_item = Gtk.MenuItem(label=label_text)
+                # GNOME Shell draws the image on the right: the tunnel's exact color
+                menu_item = Gtk.ImageMenuItem(label=label_text)
+                menu_item.set_image(Gtk.Image.new_from_pixbuf(color_dot_pixbuf(config.get('color'))))
+                menu_item.set_always_show_image(True)
                 menu_item.connect("activate", self.toggle_tunnel, config)
                 menu_item.show_all()
                 self.menu.append(menu_item)

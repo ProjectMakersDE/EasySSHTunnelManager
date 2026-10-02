@@ -53,7 +53,8 @@
   - Persistent configuration storage
 
 - **User-Friendly Interface:**
-  - Clean GTK3 interface that integrates with Gnome
+  - Dark GTK3 interface
+  - A color per tunnel, picked or entered as hex, shown in the list and as a dot in the tray menu
   - Simple dialog for configuring tunnels
   - Real-time status indicators
 
@@ -197,6 +198,7 @@ Every 5 seconds the app looks for local ports held by `ssh` processes it did not
 1. Click the **Add** button in the toolbar
 2. Fill in the tunnel configuration:
    - **Tunnel Name**: A descriptive name for this tunnel
+   - **Color**: Pick a color or type a hex value like `#7eb26d`
    - **Tunnel Type**: Choose Local, Remote, or Dynamic
    - **SSH Connection**: User, host, and port for the SSH server. Leave User and Port empty to take them from `~/.ssh/config`; a `Host` alias from that file works as host.
    - **Tunnel Details**: Port forwarding configuration
