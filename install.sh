@@ -49,6 +49,21 @@ if command -v update-desktop-database &> /dev/null; then
     update-desktop-database /usr/share/applications/
 fi
 
+# Optional autostart for the user who ran sudo
+TARGET_USER="${SUDO_USER:-}"
+if [ -n "$TARGET_USER" ] && [ -t 0 ]; then
+    read -r -p "Start Easy SSH Tunnel Manager at login for $TARGET_USER? [y/N] " AUTOSTART
+    if [[ "$AUTOSTART" =~ ^[Yy]$ ]]; then
+        TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+        AUTOSTART_DIR="$TARGET_HOME/.config/autostart"
+        install -d -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER")" "$AUTOSTART_DIR"
+        install -m 644 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER")" \
+            easy-ssh-tunnel.desktop "$AUTOSTART_DIR/easy-ssh-tunnel.desktop"
+        echo "Autostart entry installed in $AUTOSTART_DIR"
+        echo "Tunnels are not started automatically; switch them on from the tray menu."
+    fi
+fi
+
 echo
 echo "Installation complete!"
 echo "You can now launch 'Easy SSH Tunnel Manager' from your applications menu,"
