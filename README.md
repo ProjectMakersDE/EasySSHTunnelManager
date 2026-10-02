@@ -35,8 +35,7 @@
   - Icon appears in the top bar (system tray)
   - Left-click: Quick menu showing all tunnels with status indicators
   - Click on tunnel name to toggle it on/off
-  - Green dot (●) indicates running tunnels
-  - Gray circle (○) indicates stopped tunnels
+  - Each tunnel shows its status (🟢 running, 🟡 connecting, 🔴 stopped, ⚪ offline) and local port
   - "Manage Tunnels..." option to open the full configuration GUI
 
 - **Multiple Tunnel Types:**
@@ -46,8 +45,10 @@
 
 - **Easy Management:**
   - Add, edit, and remove tunnel configurations
-  - Start and stop tunnels with a single click
-  - View tunnel status in real-time
+  - Start and stop tunnels with the ON/OFF switch on each row, by double-clicking a row, or with the toolbar buttons
+  - Start all or stop all tunnels at once
+  - View tunnel status in real-time, with the last ssh error (for example a port that is already in use) in the Messages column
+  - Open an interactive ssh session to a tunnel's host in the default terminal
   - Persistent configuration storage
 
 - **User-Friendly Interface:**
@@ -75,6 +76,8 @@ cd EasySSHTunnelManager
 # Install system dependencies
 sudo apt-get update
 sudo apt-get install python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-appindicator3-0.1
+# Ubuntu 24.04 ships the Ayatana fork instead; the app uses it when AppIndicator3 is missing:
+# sudo apt-get install gir1.2-ayatanaappindicator3-0.1
 
 # Make the script executable
 chmod +x easy_ssh_tunnel.py
@@ -151,8 +154,10 @@ The application will start minimized to the system tray. Look for the network ic
 
 1. **Click the icon** in the top bar to open the quick menu
 2. You'll see all configured tunnels with status indicators:
-   - Green dot (●) = tunnel is running
-   - Gray circle (○) = tunnel is stopped
+   - 🟢 = running, the local port is open
+   - 🟡 = connecting, ssh is running but the port is not open yet
+   - 🔴 = stopped, the tunnel was switched on but the connection went down
+   - ⚪ = offline, the tunnel is switched off
 3. **Click on a tunnel name** to toggle it on/off
 4. **Click "Manage Tunnels..."** to open the full configuration window
 5. **Click "Quit"** to exit the application
@@ -164,8 +169,21 @@ The application will start minimized to the system tray. Look for the network ic
    - **Add** - Create a new tunnel configuration
    - **Edit** - Modify an existing tunnel
    - **Remove** - Delete a tunnel configuration
+   - **Start all** / **Stop all** - Start every tunnel that is not open, or stop every tunnel started by the app
    - **Start** - Activate a tunnel
-   - **Stop** - Deactivate a tunnel
+   - **Stop** - Deactivate a tunnel; on a stopped tunnel this clears it to offline
+   - **Terminal** - Open `ssh [user@]host` in the default terminal (`x-terminal-emulator`)
+3. The switch at the start of each row shows whether the tunnel's port is open and follows the connection: it turns off when ssh exits.
+4. **Quit** (tray menu, or closing the window with `--no-indicator`) stops every tunnel the app started. When tunnels are running, the app asks first.
+
+### Tunnel Status
+
+| Status | Meaning |
+|---|---|
+| Running | ssh runs and the local port is open |
+| Connecting | ssh runs, the local port is not open yet |
+| Stopped | the tunnel was switched on, but ssh exited; the Messages column shows why |
+| Offline | the tunnel is switched off |
 
 ### Adding a Tunnel
 
@@ -173,7 +191,7 @@ The application will start minimized to the system tray. Look for the network ic
 2. Fill in the tunnel configuration:
    - **Tunnel Name**: A descriptive name for this tunnel
    - **Tunnel Type**: Choose Local, Remote, or Dynamic
-   - **SSH Connection**: User, host, and port for the SSH server
+   - **SSH Connection**: User, host, and port for the SSH server. Leave User and Port empty to take them from `~/.ssh/config`; a `Host` alias from that file works as host.
    - **Tunnel Details**: Port forwarding configuration
 3. Click **OK** to save
 
@@ -218,7 +236,7 @@ You can manually edit this file if needed, but it's recommended to use the GUI.
 
 ## SSH Key Authentication
 
-This application uses the system SSH client, so it supports all SSH authentication methods configured on your system:
+This application uses the system SSH client and your `~/.ssh/config`, so it supports all SSH authentication methods configured on your system:
 - Password authentication (will prompt when starting tunnel)
 - SSH key authentication (recommended)
 
@@ -231,6 +249,8 @@ ssh-keygen -t ed25519
 # Copy your public key to the remote server
 ssh-copy-id user@remote-server
 ```
+
+Each tunnel opens its own SSH connection (`-o ControlMaster=no -o ControlPath=none`). With connection sharing enabled in `~/.ssh/config`, a forward would otherwise be added to an already open master connection and stay open after the tunnel is stopped. `ExitOnForwardFailure=yes` makes a tunnel exit when its port cannot be bound, so it does not show as running without a working forward.
 
 ## Autostart on Login
 
@@ -250,7 +270,7 @@ The application will now start in the system tray on login.
 
 ### Tunnel won't start
 - Check that you can SSH to the server manually: `ssh user@host`
-- Verify the ports are not already in use
+- Verify the ports are not already in use; the Messages column names the process that holds the port
 - Check SSH server configuration allows port forwarding
 
 ### Permission denied
@@ -263,7 +283,7 @@ The application will now start in the system tray on login.
 - Check SSH server logs for errors
 
 ### System tray icon doesn't appear
-- Make sure AppIndicator3 is installed: `sudo apt-get install gir1.2-appindicator3-0.1`
+- Make sure AppIndicator3 is installed: `sudo apt-get install gir1.2-appindicator3-0.1`, or on Ubuntu 24.04 `gir1.2-ayatanaappindicator3-0.1`
 - Some Gnome versions may need the "AppIndicator Support" or "Ubuntu AppIndicators" extension
 - Check if your desktop environment supports system tray/AppIndicator
 - Try running with `--no-indicator` flag to use window mode as fallback
