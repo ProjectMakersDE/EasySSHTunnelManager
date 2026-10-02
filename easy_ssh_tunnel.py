@@ -6,17 +6,65 @@ Now with system tray indicator support!
 
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('AppIndicator3', '0.1')
-from gi.repository import Gtk, Gdk, GLib, Pango, AppIndicator3
+try:
+    gi.require_version('AppIndicator3', '0.1')
+    from gi.repository import AppIndicator3
+except (ValueError, ImportError):
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+from gi.repository import Gtk, Gdk, GLib, Pango
 import subprocess
 import json
 import os
 import signal
 import re
+import uuid
 from pathlib import Path
 
+APP_ID = "easy-ssh-tunnel"
+APP_NAME = "Easy SSH Tunnel Manager"
+
+# ssh options that take a value, needed to find the destination in a command line
+SSH_OPTS_WITH_ARG = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def parse_ssh_argv(argv):
+    """Split an ssh argv into forwards, port, user and host.
+
+    Returns dict with keys D, L, R (lists of specs), port, user, host.
+    """
+    result = {'D': [], 'L': [], 'R': [], 'port': '', 'user': '', 'host': ''}
+    positional = []
+    i = 1 if argv and os.path.basename(argv[0]) == 'ssh' else 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith('-') and len(arg) > 1:
+            flag = arg[1]
+            if flag in SSH_OPTS_WITH_ARG:
+                value = arg[2:] if len(arg) > 2 else (argv[i + 1] if i + 1 < len(argv) else '')
+                i += 1 if len(arg) > 2 else 2
+                if flag in 'DLR':
+                    result[flag].append(value)
+                elif flag == 'p':
+                    result['port'] = value
+                elif flag == 'l':
+                    result['user'] = value
+                continue
+            i += 1
+            continue
+        positional.append(arg)
+        i += 1
+    if positional:
+        dest = positional[0]
+        if '@' in dest:
+            result['user'], result['host'] = dest.rsplit('@', 1)
+        else:
+            result['host'] = dest
+    return result
+
+
 class SSHTunnelManager:
-    """Manages SSH tunnel processes"""
+    """Manages SSH tunnel processes, keyed by the tunnel's stable id"""
 
     def __init__(self):
         self.tunnels = {}  # tunnel_id -> process
@@ -29,10 +77,12 @@ class SSHTunnelManager:
         tunnel_type = config.get('type', 'local')
         ssh_host = config.get('ssh_host', '')
         ssh_user = config.get('ssh_user', '')
-        ssh_port = config.get('ssh_port', '22')
+        ssh_port = str(config.get('ssh_port', '') or '').strip()
 
-        # Build SSH command
-        cmd = ['ssh', '-N']
+        # Own connection per tunnel: with a shared ControlMaster the forward lives in the
+        # master and survives stopping this process.
+        cmd = ['ssh', '-N', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+               '-o', 'ExitOnForwardFailure=yes']
 
         if tunnel_type == 'local':
             # Local port forwarding: -L local_port:remote_host:remote_port
@@ -77,11 +127,14 @@ class SSHTunnelManager:
             local_port = config.get('local_port', '')
             cmd.extend(['-D', local_port])
 
-        # Add SSH connection details
-        cmd.extend(['-p', ssh_port, f"{ssh_user}@{ssh_host}"])
+        # Add SSH connection details; an empty port leaves it to ~/.ssh/config
+        if ssh_port:
+            cmd.extend(['-p', ssh_port])
+        cmd.append(f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host)
 
         try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.tunnels[tunnel_id] = process
             return True, "Tunnel started successfully"
         except Exception as e:
@@ -117,20 +170,28 @@ class ConfigManager:
     """Manages tunnel configuration persistence"""
 
     def __init__(self):
-        self.config_dir = Path.home() / '.config' / 'easy-ssh-tunnel'
+        self.config_dir = Path.home() / '.config' / APP_ID
         self.config_file = self.config_dir / 'tunnels.json'
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
     def load_tunnels(self):
-        """Load saved tunnel configurations"""
+        """Load saved tunnel configurations, giving each an id"""
+        tunnels = []
         if self.config_file.exists():
             try:
                 with open(self.config_file, 'r') as f:
-                    return json.load(f)
+                    tunnels = json.load(f)
             except Exception as e:
                 print(f"Error loading config: {e}")
                 return []
-        return []
+        changed = False
+        for config in tunnels:
+            if not config.get('id'):
+                config['id'] = uuid.uuid4().hex
+                changed = True
+        if changed:
+            self.save_tunnels(tunnels)
+        return tunnels
 
     def save_tunnels(self, tunnels):
         """Save tunnel configurations"""
@@ -141,6 +202,11 @@ class ConfigManager:
         except Exception as e:
             print(f"Error saving config: {e}")
             return False
+
+    @staticmethod
+    def new_tunnel_fields(existing):
+        """Fields a tunnel being added needs"""
+        return {'id': uuid.uuid4().hex}
 
 
 class SSHCommandParser:
@@ -229,14 +295,15 @@ class SSHCommandParser:
         if port_match:
             config['ssh_port'] = port_match.group(1)
 
-        # Parse user@host (required)
-        # This should be the last non-option argument
-        user_host_match = re.search(r'(?:^|\s)([^\s@]+)@([^\s]+?)(?:\s|$)', command)
-        if user_host_match:
-            config['ssh_user'] = user_host_match.group(1)
-            config['ssh_host'] = user_host_match.group(2)
-        else:
-            raise ValueError("Could not find user@host in command")
+        # Destination: [user@]host, the first non-option argument
+        parsed = parse_ssh_argv(command.split())
+        if not parsed['host']:
+            raise ValueError("Could not find a host in command")
+        config['ssh_user'] = parsed['user']
+        config['ssh_host'] = parsed['host']
+        if not port_match:
+            # No -p: leave the port to ~/.ssh/config
+            config['ssh_port'] = ''
 
         # Generate a default name
         if config['type'] == 'local':
@@ -308,9 +375,9 @@ class SSHCommandParser:
             cmd += f" -D {local_port}"
 
         # Add SSH connection details
-        if ssh_port != '22':
+        if ssh_port and ssh_port != '22':
             cmd += f" -p {ssh_port}"
-        cmd += f" {ssh_user}@{ssh_host}"
+        cmd += f" {ssh_user}@{ssh_host}" if ssh_user else f" {ssh_host}"
 
         return cmd
 
@@ -357,7 +424,7 @@ class TunnelDialog(Gtk.Dialog):
 
         ssh_grid.attach(Gtk.Label(label="User:", xalign=0), 0, 0, 1, 1)
         self.ssh_user_entry = Gtk.Entry()
-        self.ssh_user_entry.set_placeholder_text("username")
+        self.ssh_user_entry.set_placeholder_text("from ~/.ssh/config")
         ssh_grid.attach(self.ssh_user_entry, 1, 0, 1, 1)
 
         ssh_grid.attach(Gtk.Label(label="Host:", xalign=0), 0, 1, 1, 1)
@@ -367,8 +434,7 @@ class TunnelDialog(Gtk.Dialog):
 
         ssh_grid.attach(Gtk.Label(label="Port:", xalign=0), 0, 2, 1, 1)
         self.ssh_port_entry = Gtk.Entry()
-        self.ssh_port_entry.set_text("22")
-        self.ssh_port_entry.set_placeholder_text("22")
+        self.ssh_port_entry.set_placeholder_text("from ~/.ssh/config")
         ssh_grid.attach(self.ssh_port_entry, 1, 2, 1, 1)
 
         box.pack_start(ssh_grid, False, False, 0)
@@ -479,8 +545,13 @@ class TunnelDialog(Gtk.Dialog):
             'remote_host': self.remote_host_entry.get_text(),
             'remote_port': self.remote_port_entry.get_text(),
         }
+        for key in ('name', 'ssh_user', 'ssh_host', 'ssh_port', 'local_port',
+                    'remote_host', 'remote_port'):
+            data[key] = data[key].strip()
 
-        # Preserve forwards if they exist in the original data
+        # Preserve id and forwards if they exist in the original data
+        if self.tunnel_data and self.tunnel_data.get('id'):
+            data['id'] = self.tunnel_data['id']
         if self.tunnel_data and 'forwards' in self.tunnel_data:
             data['forwards'] = self.tunnel_data['forwards']
 
@@ -491,7 +562,7 @@ class EasySSHTunnelApp(Gtk.Window):
     """Main application window"""
 
     def __init__(self, app_indicator=None, tunnel_manager=None, config_manager=None):
-        super().__init__(title="Easy SSH Tunnel Manager")
+        super().__init__(title=APP_NAME)
         self.set_default_size(700, 400)
         self.set_border_width(10)
 
@@ -502,7 +573,7 @@ class EasySSHTunnelApp(Gtk.Window):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             try:
-                self.set_wmclass("easy-ssh-tunnel", "Easy SSH Tunnel Manager")
+                self.set_wmclass(APP_ID, APP_NAME)
             except:
                 pass
 
@@ -510,7 +581,7 @@ class EasySSHTunnelApp(Gtk.Window):
         self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
 
         # Set role for window manager identification
-        self.set_role("easy-ssh-tunnel-main")
+        self.set_role(f"{APP_ID}-main")
 
         # Ensure the window can be focused and appears in taskbar
         self.set_skip_taskbar_hint(False)
@@ -560,60 +631,32 @@ class EasySSHTunnelApp(Gtk.Window):
         toolbar.set_icon_size(Gtk.IconSize.SMALL_TOOLBAR)
         toolbar.set_show_arrow(False)
 
-        add_button = Gtk.ToolButton()
-        add_button.set_label("Hinzufügen")
-        add_button.set_icon_widget(self._create_toolbar_icon("list-add-symbolic"))
-        self._style_toolbar_button(add_button, "toolbar-button-neutral")
-        add_button.connect("clicked", self.on_add_tunnel)
-        toolbar.insert(add_button, 0)
-
-        edit_button = Gtk.ToolButton()
-        edit_button.set_label("Bearbeiten")
-        edit_button.set_icon_widget(self._create_toolbar_icon("document-edit-symbolic"))
-        self._style_toolbar_button(edit_button, "toolbar-button-neutral")
-        edit_button.connect("clicked", self.on_edit_tunnel)
-        toolbar.insert(edit_button, 1)
-
-        remove_button = Gtk.ToolButton()
-        remove_button.set_label("Entfernen")
-        remove_button.set_icon_widget(self._create_toolbar_icon("user-trash-symbolic"))
-        self._style_toolbar_button(remove_button, "toolbar-button-danger")
-        remove_button.connect("clicked", self.on_remove_tunnel)
-        toolbar.insert(remove_button, 2)
-
-        toolbar.insert(Gtk.SeparatorToolItem(), 3)
-
-        start_button = Gtk.ToolButton()
-        start_button.set_label("Start")
-        start_button.set_icon_widget(self._create_toolbar_icon("media-playback-start-symbolic"))
-        self._style_toolbar_button(start_button, "toolbar-button-success")
-        start_button.connect("clicked", self.on_start_tunnel)
-        toolbar.insert(start_button, 4)
-
-        stop_button = Gtk.ToolButton()
-        stop_button.set_label("Stop")
-        stop_button.set_icon_widget(self._create_toolbar_icon("media-playback-stop-symbolic"))
-        self._style_toolbar_button(stop_button, "toolbar-button-danger")
-        stop_button.connect("clicked", self.on_stop_tunnel)
-        toolbar.insert(stop_button, 5)
-
-        toolbar.insert(Gtk.SeparatorToolItem(), 6)
-
-        import_button = Gtk.ToolButton()
-        import_button.set_label("Import")
-        import_button.set_icon_widget(self._create_toolbar_icon("document-open-symbolic"))
-        import_button.set_tooltip_text("Import SSH command")
-        self._style_toolbar_button(import_button, "toolbar-button-neutral")
-        import_button.connect("clicked", self.on_import_command)
-        toolbar.insert(import_button, 7)
-
-        export_button = Gtk.ToolButton()
-        export_button.set_label("Export")
-        export_button.set_icon_widget(self._create_toolbar_icon("document-save-symbolic"))
-        export_button.set_tooltip_text("Export all tunnels as SSH commands")
-        self._style_toolbar_button(export_button, "toolbar-button-neutral")
-        export_button.connect("clicked", self.on_export_commands)
-        toolbar.insert(export_button, 8)
+        buttons = [
+            ("Add", "list-add-symbolic", "toolbar-button-neutral", self.on_add_tunnel, None),
+            ("Edit", "document-edit-symbolic", "toolbar-button-neutral", self.on_edit_tunnel, None),
+            ("Remove", "user-trash-symbolic", "toolbar-button-danger", self.on_remove_tunnel, None),
+            None,
+            ("Start", "media-playback-start-symbolic", "toolbar-button-success", self.on_start_tunnel, None),
+            ("Stop", "media-playback-stop-symbolic", "toolbar-button-danger", self.on_stop_tunnel, None),
+            None,
+            ("Import", "document-open-symbolic", "toolbar-button-neutral", self.on_import_command,
+             "Import SSH command"),
+            ("Export", "document-save-symbolic", "toolbar-button-neutral", self.on_export_commands,
+             "Export all tunnels as SSH commands"),
+        ]
+        for position, spec in enumerate(buttons):
+            if spec is None:
+                toolbar.insert(Gtk.SeparatorToolItem(), position)
+                continue
+            label, icon, variant, handler, tooltip = spec
+            button = Gtk.ToolButton()
+            button.set_label(label)
+            button.set_icon_widget(self._create_toolbar_icon(icon))
+            if tooltip:
+                button.set_tooltip_text(tooltip)
+            self._style_toolbar_button(button, variant)
+            button.connect("clicked", handler)
+            toolbar.insert(button, position)
 
         vbox.pack_start(toolbar, False, False, 0)
 
@@ -621,33 +664,18 @@ class EasySSHTunnelApp(Gtk.Window):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
-        # ListStore: name, type, ssh_host, local_port, status, config_dict
+        # ListStore: name, type, ssh_host, local_port, status, config
         self.tunnel_store = Gtk.ListStore(str, str, str, str, str, object)
 
         self.tunnel_view = Gtk.TreeView(model=self.tunnel_store)
-        # Note: set_rules_hint is deprecated in GTK3 and ignored
-        # Alternating row colors are now controlled by the theme
 
-        # Columns
-        renderer = Gtk.CellRendererText()
-        column = Gtk.TreeViewColumn("Name", renderer, text=0)
-        column.set_min_width(120)
-        self.tunnel_view.append_column(column)
-
-        renderer = Gtk.CellRendererText()
-        column = Gtk.TreeViewColumn("Type", renderer, text=1)
-        column.set_min_width(80)
-        self.tunnel_view.append_column(column)
-
-        renderer = Gtk.CellRendererText()
-        column = Gtk.TreeViewColumn("SSH Host", renderer, text=2)
-        column.set_min_width(150)
-        self.tunnel_view.append_column(column)
-
-        renderer = Gtk.CellRendererText()
-        column = Gtk.TreeViewColumn("Local Port", renderer, text=3)
-        column.set_min_width(80)
-        self.tunnel_view.append_column(column)
+        for title, index, min_width in (("Name", 0, 120), ("Type", 1, 70),
+                                        ("SSH Host", 2, 150), ("Local Port", 3, 80)):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_min_width(min_width)
+            column.set_resizable(True)
+            self.tunnel_view.append_column(column)
 
         renderer = Gtk.CellRendererText()
         renderer.set_property("weight", Pango.Weight.BOLD)
@@ -788,156 +816,142 @@ class EasySSHTunnelApp(Gtk.Window):
             self.on_quit(widget)
             return False
 
-    def refresh_tunnel_list(self):
-        """Refresh the tunnel list view"""
-        self.tunnel_store.clear()
-        for config in self.tunnels_config:
-            tunnel_type = config.get('type', 'local').capitalize()
-            ssh_host = f"{config.get('ssh_user')}@{config.get('ssh_host')}"
-
-            # Handle multiple forwards
-            forwards = config.get('forwards', [])
-            if forwards and len(forwards) > 0:
-                # Show first local port + count
-                local_port = f"{forwards[0].get('local_port', '-')} (+{len(forwards)-1})"
-            else:
-                local_port = config.get('local_port', '-')
-
-            status = "Running" if self.tunnel_manager.is_running(config.get('name')) else "Stopped"
-
-            self.tunnel_store.append([
-                config.get('name'),
-                tunnel_type,
+    def _row_values(self, config):
+        forwards = config.get('forwards', [])
+        if forwards:
+            # Show first local port + count
+            local_port = f"{forwards[0].get('local_port', '-')} (+{len(forwards)-1})"
+        else:
+            local_port = config.get('local_port', '-')
+        user = config.get('ssh_user')
+        ssh_host = f"{user}@{config.get('ssh_host')}" if user else config.get('ssh_host', '')
+        status = "Running" if self.tunnel_manager.is_running(config.get('id')) else "Stopped"
+        return [config.get('name', ''),
+                config.get('type', 'local').capitalize(),
                 ssh_host,
                 local_port,
                 status,
-                config
-            ])
+                config]
+
+    def refresh_tunnel_list(self):
+        """Refresh the tunnel list view, keeping the selection"""
+        selected = self._selected_config()
+        selected_id = selected.get('id') if selected else None
+        self.tunnel_store.clear()
+        for config in self.tunnels_config:
+            treeiter = self.tunnel_store.append(self._row_values(config))
+            if selected_id and config.get('id') == selected_id:
+                self.tunnel_view.get_selection().select_iter(treeiter)
 
     def update_status(self):
         """Update tunnel status in the list"""
         for row in self.tunnel_store:
-            tunnel_name = row[0]
-            is_running = self.tunnel_manager.is_running(tunnel_name)
-            row[4] = "Running" if is_running else "Stopped"
+            row[4] = "Running" if self.tunnel_manager.is_running(row[5].get('id')) else "Stopped"
         return True
 
-    def on_add_tunnel(self, widget):
+    def _selected_config(self):
+        if not hasattr(self, 'tunnel_view'):
+            return None
+        model, treeiter = self.tunnel_view.get_selection().get_selected()
+        return model[treeiter][5] if treeiter else None
+
+    def _tunnels_changed(self):
+        self.config_manager.save_tunnels(self.tunnels_config)
+        if self.app_indicator:
+            self.app_indicator.update_menu()
+        else:
+            self.refresh_tunnel_list()
+
+    def on_add_tunnel(self, widget, prefill=None):
         """Add a new tunnel configuration"""
-        dialog = TunnelDialog(self)
+        dialog = TunnelDialog(self, prefill)
         response = dialog.run()
 
         if response == Gtk.ResponseType.OK:
             data = dialog.get_data()
-            if data['name'] and data['ssh_host'] and data['ssh_user']:
+            if data['name'] and data['ssh_host']:
+                data['id'] = ConfigManager.new_tunnel_fields(self.tunnels_config)['id']
                 self.tunnels_config.append(data)
-                self.config_manager.save_tunnels(self.tunnels_config)
-                self.refresh_tunnel_list()
+                self._tunnels_changed()
                 self.show_message("Tunnel configuration added")
-                # Update indicator menu if present
-                if self.app_indicator:
-                    self.app_indicator.update_menu()
             else:
-                self.show_error("Please fill in all required fields")
+                self.show_error("Please fill in at least name and host")
 
         dialog.destroy()
 
     def on_edit_tunnel(self, widget):
-        """Edit selected tunnel configuration"""
-        selection = self.tunnel_view.get_selection()
-        model, treeiter = selection.get_selected()
-
-        if treeiter:
-            config = model[treeiter][5]
-            dialog = TunnelDialog(self, config)
-            response = dialog.run()
-
-            if response == Gtk.ResponseType.OK:
-                new_data = dialog.get_data()
-                if new_data['name'] and new_data['ssh_host'] and new_data['ssh_user']:
-                    # Find and update the config
-                    for i, c in enumerate(self.tunnels_config):
-                        if c.get('name') == config.get('name'):
-                            self.tunnels_config[i] = new_data
-                            break
-                    self.config_manager.save_tunnels(self.tunnels_config)
-                    self.refresh_tunnel_list()
-                    self.show_message("Tunnel configuration updated")
-                    # Update indicator menu if present
-                    if self.app_indicator:
-                        self.app_indicator.update_menu()
-                else:
-                    self.show_error("Please fill in all required fields")
-
-            dialog.destroy()
-        else:
+        """Edit selected tunnel; a running tunnel is restarted with the new settings"""
+        config = self._selected_config()
+        if not config:
             self.show_error("Please select a tunnel to edit")
+            return
+
+        dialog = TunnelDialog(self, config)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            new_data = dialog.get_data()
+            if new_data['name'] and new_data['ssh_host']:
+                tunnel_id = config.get('id')
+                was_running = self.tunnel_manager.is_running(tunnel_id)
+                if was_running:
+                    self.tunnel_manager.stop_tunnel(tunnel_id)
+                for i, c in enumerate(self.tunnels_config):
+                    if c.get('id') == tunnel_id:
+                        self.tunnels_config[i] = new_data
+                        break
+                if was_running:
+                    self.tunnel_manager.start_tunnel(tunnel_id, new_data)
+                self._tunnels_changed()
+                self.show_message("Tunnel configuration updated"
+                                  + (" and restarted" if was_running else ""))
+            else:
+                self.show_error("Please fill in at least name and host")
+
+        dialog.destroy()
 
     def on_remove_tunnel(self, widget):
         """Remove selected tunnel configuration"""
-        selection = self.tunnel_view.get_selection()
-        model, treeiter = selection.get_selected()
-
-        if treeiter:
-            config = model[treeiter][5]
-            tunnel_name = config.get('name')
-
-            # Stop tunnel if running
-            if self.tunnel_manager.is_running(tunnel_name):
-                self.tunnel_manager.stop_tunnel(tunnel_name)
-
-            # Remove from config
-            self.tunnels_config = [c for c in self.tunnels_config if c.get('name') != tunnel_name]
-            self.config_manager.save_tunnels(self.tunnels_config)
-            self.refresh_tunnel_list()
-            self.show_message(f"Tunnel '{tunnel_name}' removed")
-            # Update indicator menu if present
-            if self.app_indicator:
-                self.app_indicator.update_menu()
-        else:
+        config = self._selected_config()
+        if not config:
             self.show_error("Please select a tunnel to remove")
+            return
+        tunnel_id = config.get('id')
+        if self.tunnel_manager.is_running(tunnel_id):
+            self.tunnel_manager.stop_tunnel(tunnel_id)
+        self.tunnels_config = [c for c in self.tunnels_config if c.get('id') != tunnel_id]
+        self._tunnels_changed()
+        self.show_message(f"Tunnel '{config.get('name')}' removed")
 
     def on_start_tunnel(self, widget):
         """Start selected tunnel"""
-        selection = self.tunnel_view.get_selection()
-        model, treeiter = selection.get_selected()
-
-        if treeiter:
-            config = model[treeiter][5]
-            tunnel_name = config.get('name')
-
-            success, message = self.tunnel_manager.start_tunnel(tunnel_name, config)
-            if success:
-                self.show_message(f"Tunnel '{tunnel_name}' started")
-                self.update_status()
-                # Update indicator menu if present
-                if self.app_indicator:
-                    self.app_indicator.update_menu()
-            else:
-                self.show_error(f"Failed to start tunnel: {message}")
-        else:
+        config = self._selected_config()
+        if not config:
             self.show_error("Please select a tunnel to start")
+            return
+        success, message = self.tunnel_manager.start_tunnel(config.get('id'), config)
+        if not success:
+            self.show_error(f"Failed to start tunnel: {message}")
+            return
+        self.show_message(f"Tunnel '{config.get('name')}' started")
+        self.update_status()
+        if self.app_indicator:
+            self.app_indicator.update_menu_status()
 
     def on_stop_tunnel(self, widget):
         """Stop selected tunnel"""
-        selection = self.tunnel_view.get_selection()
-        model, treeiter = selection.get_selected()
-
-        if treeiter:
-            config = model[treeiter][5]
-            tunnel_name = config.get('name')
-
-            success, message = self.tunnel_manager.stop_tunnel(tunnel_name)
-            if success:
-                self.show_message(f"Tunnel '{tunnel_name}' stopped")
-                self.update_status()
-                # Update indicator menu if present
-                if self.app_indicator:
-                    self.app_indicator.update_menu()
-            else:
-                self.show_error(message)
-        else:
+        config = self._selected_config()
+        if not config:
             self.show_error("Please select a tunnel to stop")
+            return
+        success, message = self.tunnel_manager.stop_tunnel(config.get('id'))
+        if not success:
+            self.show_error(message)
+            return
+        self.show_message(f"Tunnel '{config.get('name')}' stopped")
+        self.update_status()
+        if self.app_indicator:
+            self.app_indicator.update_menu_status()
 
     def on_import_command(self, widget):
         """Import SSH commands (supports multiple commands, one per line)"""
@@ -1116,12 +1130,10 @@ class EasySSHTunnelApp(Gtk.Window):
 
                 # Save if any tunnels were imported
                 if imported_count > 0:
+                    # Saving and reloading gives the imported tunnels an id and color
                     self.config_manager.save_tunnels(self.tunnels_config)
-                    self.refresh_tunnel_list()
-
-                    # Update indicator menu if present
-                    if self.app_indicator:
-                        self.app_indicator.update_menu()
+                    self.tunnels_config = self.config_manager.load_tunnels()
+                    self._tunnels_changed()
 
                 # Show results
                 if imported_count > 0 and failed_count == 0:
@@ -1280,13 +1292,13 @@ class SSHTunnelIndicator:
 
         # Create the indicator with icon theme path
         self.indicator = AppIndicator3.Indicator.new(
-            "easy-ssh-tunnel",
+            APP_ID,
             self.icon_name_white,
             AppIndicator3.IndicatorCategory.APPLICATION_STATUS
         )
         self.indicator.set_icon_theme_path(self.icon_theme_path)
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-        self.indicator.set_title("SSH Tunnel Manager")
+        self.indicator.set_title(APP_NAME)
 
         # Set attention icon for when tunnels are active (green)
         self.indicator.set_attention_icon(self.icon_name_green)
@@ -1309,6 +1321,11 @@ class SSHTunnelIndicator:
         # Update menu and icon periodically to refresh status
         GLib.timeout_add_seconds(2, self.update_menu_status)
 
+    def _menu_label(self, config):
+        """(running, label); green dot for connected, red dot for disconnected"""
+        running = self.tunnel_manager.is_running(config.get('id'))
+        return running, f"{'🟢' if running else '🔴'} {config.get('name', 'Unknown')}"
+
     def build_menu(self):
         """Build the indicator menu"""
         # Clear existing menu items
@@ -1318,53 +1335,29 @@ class SSHTunnelIndicator:
         # Store references to tunnel menu items for status updates
         self.tunnel_menu_items = {}
 
-        # Add tunnels section
         if self.tunnels_config:
             for config in self.tunnels_config:
-                tunnel_name = config.get('name', 'Unknown')
-                is_running = self.tunnel_manager.is_running(tunnel_name)
-
-                # Create menu item with status indicator and name
-                # Using Unicode colored circles that work better with system themes
-                if is_running:
-                    # Green dot for connected
-                    label_text = f"🟢 {tunnel_name}"
-                else:
-                    # Red dot for disconnected
-                    label_text = f"🔴 {tunnel_name}"
-
+                _, label_text = self._menu_label(config)
                 menu_item = Gtk.MenuItem(label=label_text)
-
-                # Toggle tunnel on/off when clicked
                 menu_item.connect("activate", self.toggle_tunnel, config)
                 menu_item.show_all()
                 self.menu.append(menu_item)
-
-                # Store reference for status updates
-                self.tunnel_menu_items[tunnel_name] = menu_item
-
-            # Separator
-            separator = Gtk.SeparatorMenuItem()
-            separator.show()
-            self.menu.append(separator)
+                self.tunnel_menu_items[config.get('id')] = (menu_item, config)
         else:
-            # No tunnels configured
             item = Gtk.MenuItem(label="No tunnels configured")
             item.set_sensitive(False)
             item.show()
             self.menu.append(item)
 
-            separator = Gtk.SeparatorMenuItem()
-            separator.show()
-            self.menu.append(separator)
+        separator = Gtk.SeparatorMenuItem()
+        separator.show()
+        self.menu.append(separator)
 
-        # Open settings (right-click behavior on left-click item)
         settings_item = Gtk.MenuItem(label="Manage Tunnels...")
         settings_item.connect("activate", self.show_main_window)
         settings_item.show()
         self.menu.append(settings_item)
 
-        # Quit
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", self.quit_app)
         quit_item.show()
@@ -1379,20 +1372,14 @@ class SSHTunnelIndicator:
 
     def update_menu_status(self):
         """Update menu status indicators periodically without rebuilding menu"""
-        # Check if any tunnel is running
         any_running = False
-        if hasattr(self, 'tunnel_menu_items'):
-            for tunnel_name, menu_item in self.tunnel_menu_items.items():
-                is_running = self.tunnel_manager.is_running(tunnel_name)
-                if is_running:
-                    any_running = True
-                    # Green dot for connected
-                    menu_item.set_label(f"🟢 {tunnel_name}")
-                else:
-                    # Red dot for disconnected
-                    menu_item.set_label(f"🔴 {tunnel_name}")
+        for menu_item, config in getattr(self, 'tunnel_menu_items', {}).values():
+            running, label_text = self._menu_label(config)
+            if running:
+                any_running = True
+            if menu_item.get_label() != label_text:
+                menu_item.set_label(label_text)
 
-        # Update tray icon status based on connection status
         # Switch between ACTIVE (normal icon) and ATTENTION (active icon)
         if any_running and not self.currently_active:
             self.indicator.set_status(AppIndicator3.IndicatorStatus.ATTENTION)
@@ -1405,17 +1392,13 @@ class SSHTunnelIndicator:
 
     def toggle_tunnel(self, widget, config):
         """Toggle tunnel on/off"""
-        tunnel_name = config.get('name')
-
-        if self.tunnel_manager.is_running(tunnel_name):
-            # Stop the tunnel
-            self.tunnel_manager.stop_tunnel(tunnel_name)
+        tunnel_id = config.get('id')
+        if self.tunnel_manager.is_running(tunnel_id):
+            self.tunnel_manager.stop_tunnel(tunnel_id)
         else:
-            # Start the tunnel
-            self.tunnel_manager.start_tunnel(tunnel_name, config)
-
-        # Update menu and window
-        self.update_menu()
+            self.tunnel_manager.start_tunnel(tunnel_id, config)
+        self.window.update_status()
+        self.update_menu_status()
 
     def show_main_window(self, widget=None):
         """Show the main configuration window"""
