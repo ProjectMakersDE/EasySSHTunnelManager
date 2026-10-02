@@ -1017,7 +1017,8 @@ class EasySSHTunnelApp(Gtk.Window):
         # Update status periodically, scan for outside tunnels a bit less often
         GLib.timeout_add_seconds(2, self.update_status)
         GLib.timeout_add_seconds(5, self.auto_scan)
-        GLib.idle_add(self.auto_scan)
+        # One scan at startup; auto_scan returns True to keep the timer, so wrap it
+        GLib.idle_add(lambda: self.auto_scan() and False)
 
         # Handle window close to hide instead of quit (when running with indicator)
         self.connect("delete-event", self.on_window_delete)
