@@ -49,6 +49,7 @@
   - Start all or stop all tunnels at once
   - View tunnel status in real-time, with the last ssh error (for example a port that is already in use) in the Messages column
   - Open an interactive ssh session to a tunnel's host in the default terminal
+  - Detect tunnels opened outside the app (a plain `ssh -D/-L` in a terminal, or a forward on a shared ControlMaster connection) and add them to the list
   - Persistent configuration storage
 
 - **User-Friendly Interface:**
@@ -156,6 +157,7 @@ The application will start minimized to the system tray. Look for the network ic
 2. You'll see all configured tunnels with status indicators:
    - 🟢 = running, the local port is open
    - 🟡 = connecting, ssh is running but the port is not open yet
+   - 🟠 = external, the port is held by an ssh process outside the app
    - 🔴 = stopped, the tunnel was switched on but the connection went down
    - ⚪ = offline, the tunnel is switched off
 3. **Click on a tunnel name** to toggle it on/off
@@ -183,7 +185,12 @@ The application will start minimized to the system tray. Look for the network ic
 | Running | ssh runs and the local port is open |
 | Connecting | ssh runs, the local port is not open yet |
 | Stopped | the tunnel was switched on, but ssh exited; the Messages column shows why |
+| External | the tunnel's port is held by an ssh process outside the app |
 | Offline | the tunnel is switched off |
+
+### Tunnels Opened Outside the App
+
+Every 5 seconds the app looks for local ports held by `ssh` processes it did not start. New ones appear in a bar above the list: **Review** opens a dialog to add them, **Ignore** hides them. A tunnel in the list whose port is held this way shows as **External**. Stopping it asks first, then ends that ssh process, or for a forward on a shared ControlMaster connection runs `ssh -O cancel`.
 
 ### Adding a Tunnel
 

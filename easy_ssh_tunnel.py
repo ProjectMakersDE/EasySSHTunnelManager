@@ -20,6 +20,7 @@ import os
 import shutil
 import signal
 import re
+import socket
 import threading
 import time
 import uuid
@@ -31,12 +32,13 @@ APP_NAME = "Easy SSH Tunnel Manager"
 # Status colors
 COLOR_GREEN = "#73bf69"
 COLOR_RED = "#f2495c"
+COLOR_ORANGE = "#ff9830"
 COLOR_YELLOW = "#fade2a"
 COLOR_DIM = "#8e8e9a"
 COLOR_GREY = "#6e7180"
 
 # Statuses that mean the port is open; the row switch shows these as ON
-ON_STATUSES = ("Running", "Connecting")
+ON_STATUSES = ("Running", "Connecting", "External")
 
 # ssh options that take a value, needed to find the destination in a command line
 SSH_OPTS_WITH_ARG = set("BbcDEeFIiJLlmOoPpQRSWw")
@@ -87,10 +89,32 @@ def parse_ssh_argv(argv):
     return result
 
 
+def spec_local_port(spec):
+    """Local port of a -D/-L spec like '1080', 'localhost:1080' or '8080:host:80'"""
+    parts = spec.split(':')
+    if len(parts) in (1, 2):
+        return parts[-1]
+    if len(parts) >= 3:
+        return parts[-3]
+    return ''
+
+
+def socks_probe(port):
+    """True if a SOCKS5 server answers on 127.0.0.1:port"""
+    try:
+        with socket.create_connection(('127.0.0.1', int(port)), timeout=0.5) as sock:
+            sock.settimeout(0.5)
+            sock.sendall(b'\x05\x01\x00')
+            return sock.recv(2) == b'\x05\x00'
+    except (OSError, ValueError):
+        return False
+
+
 class PortScanner:
     """Lists local TCP listeners with owning process, cached for a second"""
 
     SS_LINE = re.compile(r'(\S+):(\d+)\s+\S+\s+users:\(\("([^"]+)",pid=(\d+)')
+    MUX_RE = re.compile(r'^ssh: (\S*ssh_mux_(?:tunnel_)?(.+)_(\d+)_([^_\s]+)) \[mux\]')
 
     def __init__(self):
         self._cache = {}
@@ -117,6 +141,45 @@ class PortScanner:
         self._cache = found
         self._stamp = time.monotonic()
         return found
+
+    @staticmethod
+    def cmdline(pid):
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                return [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
+        except OSError:
+            return []
+
+    def external_tunnels(self, own_pids):
+        """Describe ssh-owned listening ports not started by this app"""
+        tunnels = []
+        for port, info in sorted(self.listeners().items(), key=lambda kv: int(kv[0])):
+            if info['proc'] != 'ssh' or info['pid'] in own_pids:
+                continue
+            argv = self.cmdline(info['pid'])
+            entry = {'port': port, 'pid': info['pid'], 'command': ' '.join(argv),
+                     'type': '', 'user': '', 'host': '', 'ssh_port': '',
+                     'remote_host': '', 'remote_port': '', 'control_path': ''}
+            mux = self.MUX_RE.match(' '.join(argv))
+            if mux:
+                # Forward was added to a shared ControlMaster connection
+                entry.update(control_path=mux.group(1), host=mux.group(2),
+                             ssh_port=mux.group(3), user=mux.group(4))
+                entry['type'] = 'dynamic' if socks_probe(port) else 'local'
+            else:
+                parsed = parse_ssh_argv(argv)
+                entry.update(user=parsed['user'], host=parsed['host'], ssh_port=parsed['port'])
+                for spec in parsed['D']:
+                    if spec_local_port(spec) == port:
+                        entry['type'] = 'dynamic'
+                for spec in parsed['L']:
+                    if spec_local_port(spec) == port:
+                        parts = spec.split(':')
+                        entry.update(type='local', remote_host=parts[-2], remote_port=parts[-1])
+                if not entry['type']:
+                    entry['type'] = 'dynamic' if socks_probe(port) else 'local'
+            tunnels.append(entry)
+        return tunnels
 
 
 class SSHTunnelManager:
@@ -252,6 +315,9 @@ class SSHTunnelManager:
             return self.tunnels[tunnel_id].poll() is None
         return False
 
+    def own_pids(self):
+        return {p.pid for p in self.tunnels.values() if p.poll() is None}
+
     def status(self, config):
         """Return (label, color, message) for a tunnel"""
         tunnel_id = config.get('id')
@@ -263,6 +329,8 @@ class SSHTunnelManager:
             if not port or (owner and owner['pid'] == process.pid):
                 return "Running", COLOR_GREEN, message
             return "Connecting", COLOR_YELLOW, message
+        if owner and owner['proc'] == 'ssh':
+            return "External", COLOR_ORANGE, message or f"opened outside the app (ssh pid {owner['pid']})"
         if owner and not message:
             who = f"{owner['proc']} (pid {owner['pid']})" if owner['pid'] else "another user"
             message = f"port {port} in use by {who}"
@@ -270,6 +338,31 @@ class SSHTunnelManager:
             # Switched on, but the connection went down
             return "Stopped", COLOR_RED, message or "connection went down"
         return "Offline", COLOR_GREY, message
+
+    def stop_external(self, config):
+        """Close a tunnel port held by an ssh process outside this app"""
+        port = tunnel_port(config)
+        for entry in self.scanner.external_tunnels(self.own_pids()):
+            if entry['port'] != port:
+                continue
+            if entry['control_path']:
+                if entry['type'] != 'dynamic':
+                    return False, (f"port {port} is a forward on a shared ssh connection to "
+                                   f"{entry['host']}; close it with ssh -O cancel -L <spec>")
+                result = subprocess.run(['ssh', '-S', entry['control_path'], '-O', 'cancel',
+                                         '-D', port, entry['host']],
+                                        capture_output=True, text=True, timeout=10)
+                self.scanner._stamp = 0.0
+                if result.returncode != 0:
+                    return False, result.stderr.strip() or "ssh -O cancel failed"
+                return True, f"Closed port {port} on the shared ssh connection"
+            try:
+                os.kill(entry['pid'], signal.SIGTERM)
+            except OSError as e:
+                return False, str(e)
+            self.scanner._stamp = 0.0
+            return True, f"Stopped ssh pid {entry['pid']}"
+        return False, f"No external ssh process found on port {port}"
 
     def cleanup(self):
         """Stop all running tunnels"""
@@ -855,6 +948,20 @@ class EasySSHTunnelApp(Gtk.Window):
 
         vbox.pack_start(toolbar, False, False, 0)
 
+        # Shown when the automatic scan finds tunnels opened outside the app
+        self.scan_bar = Gtk.InfoBar()
+        self.scan_bar.set_message_type(Gtk.MessageType.INFO)
+        self.scan_bar.add_button("Review", Gtk.ResponseType.OK)
+        self.scan_bar.add_button("Ignore", Gtk.ResponseType.CLOSE)
+        self.scan_bar.connect("response", self.on_scan_bar_response)
+        self.scan_label = Gtk.Label(xalign=0)
+        self.scan_label.set_line_wrap(True)
+        self.scan_bar.get_content_area().add(self.scan_label)
+        self.scan_bar.set_no_show_all(True)
+        self.scan_bar.get_content_area().show_all()
+        self.ignored_external = set()  # (port, pid) the user dismissed
+        vbox.pack_start(self.scan_bar, False, False, 0)
+
         # Tunnel list
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -907,8 +1014,10 @@ class EasySSHTunnelApp(Gtk.Window):
         # Load saved tunnels
         self.refresh_tunnel_list()
 
-        # Update status periodically
+        # Update status periodically, scan for outside tunnels a bit less often
         GLib.timeout_add_seconds(2, self.update_status)
+        GLib.timeout_add_seconds(5, self.auto_scan)
+        GLib.idle_add(self.auto_scan)
 
         # Handle window close to hide instead of quit (when running with indicator)
         self.connect("delete-event", self.on_window_delete)
@@ -1082,6 +1191,11 @@ class EasySSHTunnelApp(Gtk.Window):
         else:
             self.refresh_tunnel_list()
 
+    def window_select(self, tunnel_id):
+        for row in self.tunnel_store:
+            if row[7].get('id') == tunnel_id:
+                self.tunnel_view.get_selection().select_iter(row.iter)
+
     def on_switch_toggled(self, renderer, path):
         """Switch in the list starts or stops that row's tunnel"""
         self.tunnel_view.get_selection().select_path(path)
@@ -1175,7 +1289,7 @@ class EasySSHTunnelApp(Gtk.Window):
             self.app_indicator.update_menu_status()
 
     def on_stop_tunnel(self, widget):
-        """Stop selected tunnel"""
+        """Stop selected tunnel, also when it was opened outside the app"""
         config = self._selected_config()
         if not config:
             self.show_error("Please select a tunnel to stop")
@@ -1184,6 +1298,8 @@ class EasySSHTunnelApp(Gtk.Window):
         if self.tunnel_manager.is_running(tunnel_id):
             self.tunnel_manager.stop_tunnel(tunnel_id)
             self.show_message(f"Tunnel '{config.get('name')}' stopped")
+        elif self.tunnel_manager.status(config)[0] == "External":
+            self.stop_external(config)
         else:
             self.tunnel_manager.stop_tunnel(tunnel_id)
             self.show_message(f"Tunnel '{config.get('name')}' is offline")
@@ -1191,6 +1307,29 @@ class EasySSHTunnelApp(Gtk.Window):
         self.update_status()
         if self.app_indicator:
             self.app_indicator.update_menu_status()
+
+    def stop_external(self, config):
+        """Ask, then close a tunnel port that an ssh process outside the app holds"""
+        port = tunnel_port(config)
+        owner = self.tunnel_manager.port_owner(port) or {}
+        command = ' '.join(PortScanner.cmdline(owner.get('pid', 0)))
+        dialog = Gtk.MessageDialog(
+            parent=self, flags=0, message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Port {port} was opened outside this app. Stop it?")
+        dialog.format_secondary_text(
+            f"pid {owner.get('pid')}: {command}\n\n"
+            "If this is an interactive ssh session, stopping it closes that session too. "
+            "A shared ControlMaster connection only gets this port cancelled.")
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.YES:
+            return
+        success, message = self.tunnel_manager.stop_external(config)
+        if success:
+            self.show_message(message)
+        else:
+            self.show_error(message)
 
     def on_start_all(self, widget):
         started = 0
@@ -1214,6 +1353,29 @@ class EasySSHTunnelApp(Gtk.Window):
         if self.app_indicator:
             self.app_indicator.update_menu_status()
 
+    def _new_external(self):
+        """Outside tunnels that are not in the list and not dismissed"""
+        known_ports = {tunnel_port(c) for c in self.tunnels_config}
+        return [e for e in self.tunnel_manager.scanner.external_tunnels(self.tunnel_manager.own_pids())
+                if e['port'] not in known_ports and (e['port'], e['pid']) not in self.ignored_external]
+
+    def auto_scan(self):
+        found = self._new_external()
+        if found:
+            ports = ", ".join(f"{e['port']} ({e['host']})" for e in found)
+            self.scan_label.set_text(f"Found {len(found)} tunnel(s) opened outside the app: {ports}")
+            self.scan_bar.show()
+        else:
+            self.scan_bar.hide()
+        return True
+
+    def on_scan_bar_response(self, bar, response):
+        if response == Gtk.ResponseType.OK:
+            self.on_scan(None)
+        else:
+            self.ignored_external.update((e['port'], e['pid']) for e in self._new_external())
+        self.auto_scan()
+
     def on_open_terminal(self, widget):
         """Open an interactive ssh session to the tunnel's host in the default terminal"""
         config = self._selected_config()
@@ -1234,6 +1396,82 @@ class EasySSHTunnelApp(Gtk.Window):
             self.show_message(f"Opened {' '.join(cmd)} in terminal")
         except OSError as e:
             self.show_error(f"Could not open terminal: {e}")
+
+    def on_scan(self, widget):
+        """List tunnels opened outside this app and offer to add them"""
+        found = self.tunnel_manager.scanner.external_tunnels(self.tunnel_manager.own_pids())
+        known_ports = {tunnel_port(c) for c in self.tunnels_config}
+
+        dialog = Gtk.Dialog(title="Tunnels opened outside the app", parent=self, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE,
+                           "Add selected", Gtk.ResponseType.OK)
+        dialog.set_default_size(820, 300)
+        box = dialog.get_content_area()
+        box.set_spacing(6)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{margin}")(12)
+
+        if not found:
+            box.pack_start(Gtk.Label(label="No ssh tunnels found outside this app.", xalign=0),
+                           False, False, 0)
+            dialog.set_response_sensitive(Gtk.ResponseType.OK, False)
+        # add, port, type, host, pid, command, in_list, entry
+        store = Gtk.ListStore(bool, str, str, str, str, str, bool, object)
+        for entry in found:
+            in_list = entry['port'] in known_ports
+            host = f"{entry['user']}@{entry['host']}" if entry['user'] else entry['host']
+            store.append([not in_list, entry['port'], entry['type'], host, str(entry['pid']),
+                          entry['command'] + ("   (already in list)" if in_list else ""),
+                          not in_list, entry])
+        view = Gtk.TreeView(model=store)
+        view.get_style_context().add_class("tunnel-list")
+        toggle = Gtk.CellRendererToggle()
+
+        def on_toggled(renderer, path):
+            if store[path][6]:
+                store[path][0] = not store[path][0]
+        toggle.connect("toggled", on_toggled)
+        view.append_column(Gtk.TreeViewColumn("Add", toggle, active=0, activatable=6))
+        for title, index in (("Port", 1), ("Type", 2), ("Host", 3), ("PID", 4)):
+            view.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=index))
+        renderer = Gtk.CellRendererText()
+        renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+        renderer.set_property("foreground", COLOR_DIM)
+        column = Gtk.TreeViewColumn("Command", renderer, text=5)
+        column.set_expand(True)
+        view.append_column(column)
+        view.set_tooltip_column(5)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.add(view)
+        box.pack_start(scrolled, True, True, 0)
+        dialog.show_all()
+
+        added = 0
+        if dialog.run() == Gtk.ResponseType.OK:
+            for row in store:
+                if not (row[0] and row[6]):
+                    continue
+                entry = row[7]
+                config = {
+                    'name': f"{entry['host']} :{entry['port']}",
+                    'type': entry['type'],
+                    'ssh_user': entry['user'],
+                    'ssh_host': entry['host'],
+                    'ssh_port': entry['ssh_port'],
+                    'local_port': entry['port'],
+                    'remote_host': entry['remote_host'],
+                    'remote_port': entry['remote_port'],
+                }
+                config.update(ConfigManager.new_tunnel_fields(self.tunnels_config))
+                if entry['type'] == 'local' and not entry['remote_host']:
+                    self.tunnel_manager.messages[config['id']] = \
+                        "remote host/port unknown (shared ssh connection), set them via Edit"
+                self.tunnels_config.append(config)
+                added += 1
+        dialog.destroy()
+        if added:
+            self._tunnels_changed()
+            self.show_message(f"Added {added} tunnel(s); they show as External until stopped")
 
     def on_import_command(self, widget):
         """Import SSH commands (supports multiple commands, one per line)"""
@@ -1626,7 +1864,8 @@ class SSHTunnelIndicator:
         # Update menu and icon periodically to refresh status
         GLib.timeout_add_seconds(2, self.update_menu_status)
 
-    STATUS_EMOJI = {"Running": "🟢", "Connecting": "🟡", "Stopped": "🔴", "Offline": "⚪"}
+    STATUS_EMOJI = {"Running": "🟢", "Connecting": "🟡", "External": "🟠",
+                    "Stopped": "🔴", "Offline": "⚪"}
 
     def _menu_label(self, config):
         """(status, label); the label starts with the status emoji"""
@@ -1700,10 +1939,15 @@ class SSHTunnelIndicator:
         return True
 
     def toggle_tunnel(self, widget, config):
-        """Toggle tunnel on/off"""
+        """Toggle tunnel on/off; tunnels opened outside the app are handled in the window"""
         tunnel_id = config.get('id')
+        status = self.tunnel_manager.status(config)[0]
         if self.tunnel_manager.is_running(tunnel_id):
             self.tunnel_manager.stop_tunnel(tunnel_id)
+        elif status == "External":
+            self.show_main_window()
+            self.window.window_select(tunnel_id)
+            self.window.stop_external(config)
         else:
             self.tunnel_manager.start_tunnel(tunnel_id, config)
         self.tunnel_manager.scanner._stamp = 0.0
