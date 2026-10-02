@@ -75,6 +75,8 @@ cd EasySSHTunnelManager
 # Install system dependencies
 sudo apt-get update
 sudo apt-get install python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-appindicator3-0.1
+# Ubuntu 24.04 ships the Ayatana fork instead; the app uses it when AppIndicator3 is missing:
+# sudo apt-get install gir1.2-ayatanaappindicator3-0.1
 
 # Make the script executable
 chmod +x easy_ssh_tunnel.py
@@ -173,7 +175,7 @@ The application will start minimized to the system tray. Look for the network ic
 2. Fill in the tunnel configuration:
    - **Tunnel Name**: A descriptive name for this tunnel
    - **Tunnel Type**: Choose Local, Remote, or Dynamic
-   - **SSH Connection**: User, host, and port for the SSH server
+   - **SSH Connection**: User, host, and port for the SSH server. Leave User and Port empty to take them from `~/.ssh/config`; a `Host` alias from that file works as host.
    - **Tunnel Details**: Port forwarding configuration
 3. Click **OK** to save
 
@@ -218,7 +220,7 @@ You can manually edit this file if needed, but it's recommended to use the GUI.
 
 ## SSH Key Authentication
 
-This application uses the system SSH client, so it supports all SSH authentication methods configured on your system:
+This application uses the system SSH client and your `~/.ssh/config`, so it supports all SSH authentication methods configured on your system:
 - Password authentication (will prompt when starting tunnel)
 - SSH key authentication (recommended)
 
@@ -231,6 +233,8 @@ ssh-keygen -t ed25519
 # Copy your public key to the remote server
 ssh-copy-id user@remote-server
 ```
+
+Each tunnel opens its own SSH connection (`-o ControlMaster=no -o ControlPath=none`). With connection sharing enabled in `~/.ssh/config`, a forward would otherwise be added to an already open master connection and stay open after the tunnel is stopped. `ExitOnForwardFailure=yes` makes a tunnel exit when its port cannot be bound, so it does not show as running without a working forward.
 
 ## Autostart on Login
 
@@ -263,7 +267,7 @@ The application will now start in the system tray on login.
 - Check SSH server logs for errors
 
 ### System tray icon doesn't appear
-- Make sure AppIndicator3 is installed: `sudo apt-get install gir1.2-appindicator3-0.1`
+- Make sure AppIndicator3 is installed: `sudo apt-get install gir1.2-appindicator3-0.1`, or on Ubuntu 24.04 `gir1.2-ayatanaappindicator3-0.1`
 - Some Gnome versions may need the "AppIndicator Support" or "Ubuntu AppIndicators" extension
 - Check if your desktop environment supports system tray/AppIndicator
 - Try running with `--no-indicator` flag to use window mode as fallback
