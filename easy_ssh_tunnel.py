@@ -12,20 +12,44 @@ try:
 except (ValueError, ImportError):
     gi.require_version('AyatanaAppIndicator3', '0.1')
     from gi.repository import AyatanaAppIndicator3 as AppIndicator3
-from gi.repository import Gtk, Gdk, GLib, Pango
+from gi.repository import Gtk, Gdk, GLib, GObject, Pango
+import cairo
 import subprocess
 import json
 import os
+import shutil
 import signal
 import re
+import threading
+import time
 import uuid
 from pathlib import Path
 
 APP_ID = "easy-ssh-tunnel"
 APP_NAME = "Easy SSH Tunnel Manager"
 
+# Status colors
+COLOR_GREEN = "#73bf69"
+COLOR_RED = "#f2495c"
+COLOR_YELLOW = "#fade2a"
+COLOR_DIM = "#8e8e9a"
+COLOR_GREY = "#6e7180"
+
+# Statuses that mean the port is open; the row switch shows these as ON
+ON_STATUSES = ("Running", "Connecting")
+
 # ssh options that take a value, needed to find the destination in a command line
 SSH_OPTS_WITH_ARG = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def tunnel_port(config):
+    """Local port a tunnel listens on, or '' for remote tunnels"""
+    if config.get('type') == 'remote':
+        return ''
+    forwards = config.get('forwards') or []
+    if forwards:
+        return str(forwards[0].get('local_port', ''))
+    return str(config.get('local_port', ''))
 
 
 def parse_ssh_argv(argv):
@@ -63,16 +87,78 @@ def parse_ssh_argv(argv):
     return result
 
 
+class PortScanner:
+    """Lists local TCP listeners with owning process, cached for a second"""
+
+    SS_LINE = re.compile(r'(\S+):(\d+)\s+\S+\s+users:\(\("([^"]+)",pid=(\d+)')
+
+    def __init__(self):
+        self._cache = {}
+        self._stamp = 0.0
+
+    def listeners(self):
+        """Return {port: {'pid': int, 'proc': str}}"""
+        if time.monotonic() - self._stamp < 1.0:
+            return self._cache
+        found = {}
+        try:
+            out = subprocess.run(['ss', '-ltnpH'], capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ''
+        for line in out.splitlines():
+            match = self.SS_LINE.search(line)
+            if match:
+                found.setdefault(match.group(2), {'pid': int(match.group(4)), 'proc': match.group(3)})
+            else:
+                # Socket owned by another user: port known, process not
+                cols = line.split()
+                if len(cols) >= 4 and ':' in cols[3]:
+                    found.setdefault(cols[3].rsplit(':', 1)[1], {'pid': 0, 'proc': '?'})
+        self._cache = found
+        self._stamp = time.monotonic()
+        return found
+
+
 class SSHTunnelManager:
     """Manages SSH tunnel processes, keyed by the tunnel's stable id"""
 
     def __init__(self):
         self.tunnels = {}  # tunnel_id -> process
+        self.messages = {}  # tunnel_id -> last ssh error line
+        self.wanted = set()  # tunnel ids the user switched on; down while wanted = Stopped
+        self.scanner = PortScanner()
+
+    def _read_stderr(self, tunnel_id, process):
+        """Keep the last stderr line of a tunnel as its message"""
+        for raw in iter(process.stderr.readline, b''):
+            line = raw.decode(errors='replace').strip()
+            if line:
+                self.messages[tunnel_id] = line
+        code = process.wait()
+        if self.tunnels.get(tunnel_id) is process and code not in (0, -signal.SIGTERM):
+            if not self.messages.get(tunnel_id):
+                self.messages[tunnel_id] = f"ssh exited with code {code}"
+
+    def port_owner(self, port):
+        """Describe who listens on a local port, or None"""
+        info = self.scanner.listeners().get(str(port)) if port else None
+        if not info:
+            return None
+        return info
 
     def start_tunnel(self, tunnel_id, config):
         """Start an SSH tunnel with the given configuration"""
         if tunnel_id in self.tunnels and self.tunnels[tunnel_id].poll() is None:
             return False, "Tunnel already running"
+        self.wanted.add(tunnel_id)
+
+        port = tunnel_port(config)
+        owner = self.port_owner(port)
+        if owner:
+            who = f"{owner['proc']} (pid {owner['pid']})" if owner['pid'] else "another user"
+            message = f"port {port} already in use by {who}"
+            self.messages[tunnel_id] = message
+            return False, message
 
         tunnel_type = config.get('type', 'local')
         ssh_host = config.get('ssh_host', '')
@@ -82,7 +168,7 @@ class SSHTunnelManager:
         # Own connection per tunnel: with a shared ControlMaster the forward lives in the
         # master and survives stopping this process.
         cmd = ['ssh', '-N', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
-               '-o', 'ExitOnForwardFailure=yes']
+               '-o', 'ExitOnForwardFailure=yes', '-o', 'LogLevel=ERROR']
 
         if tunnel_type == 'local':
             # Local port forwarding: -L local_port:remote_host:remote_port
@@ -134,14 +220,19 @@ class SSHTunnelManager:
 
         try:
             process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.tunnels[tunnel_id] = process
-            return True, "Tunnel started successfully"
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         except Exception as e:
+            self.messages[tunnel_id] = str(e)
             return False, str(e)
+        self.tunnels[tunnel_id] = process
+        self.messages[tunnel_id] = ''
+        threading.Thread(target=self._read_stderr, args=(tunnel_id, process), daemon=True).start()
+        return True, "Tunnel started successfully"
 
     def stop_tunnel(self, tunnel_id):
-        """Stop a running SSH tunnel"""
+        """Stop a running SSH tunnel; the tunnel goes Offline"""
+        self.wanted.discard(tunnel_id)
+        self.messages[tunnel_id] = ''
         if tunnel_id in self.tunnels:
             process = self.tunnels[tunnel_id]
             if process.poll() is None:
@@ -151,6 +242,7 @@ class SSHTunnelManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
             del self.tunnels[tunnel_id]
+            self.messages[tunnel_id] = ''
             return True, "Tunnel stopped"
         return False, "Tunnel not found"
 
@@ -159,6 +251,25 @@ class SSHTunnelManager:
         if tunnel_id in self.tunnels:
             return self.tunnels[tunnel_id].poll() is None
         return False
+
+    def status(self, config):
+        """Return (label, color, message) for a tunnel"""
+        tunnel_id = config.get('id')
+        port = tunnel_port(config)
+        owner = self.port_owner(port)
+        message = self.messages.get(tunnel_id, '')
+        if self.is_running(tunnel_id):
+            process = self.tunnels[tunnel_id]
+            if not port or (owner and owner['pid'] == process.pid):
+                return "Running", COLOR_GREEN, message
+            return "Connecting", COLOR_YELLOW, message
+        if owner and not message:
+            who = f"{owner['proc']} (pid {owner['pid']})" if owner['pid'] else "another user"
+            message = f"port {port} in use by {who}"
+        if tunnel_id in self.wanted:
+            # Switched on, but the connection went down
+            return "Stopped", COLOR_RED, message or "connection went down"
+        return "Offline", COLOR_GREY, message
 
     def cleanup(self):
         """Stop all running tunnels"""
@@ -207,6 +318,21 @@ class ConfigManager:
     def new_tunnel_fields(existing):
         """Fields a tunnel being added needs"""
         return {'id': uuid.uuid4().hex}
+
+
+def terminal_command():
+    """Command prefix that runs a program in the default terminal"""
+    if shutil.which('x-terminal-emulator'):
+        return ['x-terminal-emulator', '-e']
+    try:
+        out = subprocess.run(['gsettings', 'get', 'org.gnome.desktop.default-applications.terminal',
+                              'exec'], capture_output=True, text=True, timeout=3).stdout
+        terminal = out.strip().strip("'")
+        if terminal and shutil.which(terminal):
+            return [terminal, '--' if terminal == 'gnome-terminal' else '-e']
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ['gnome-terminal', '--']
 
 
 class SSHCommandParser:
@@ -380,6 +506,68 @@ class SSHCommandParser:
         cmd += f" {ssh_user}@{ssh_host}" if ssh_user else f" {ssh_host}"
 
         return cmd
+
+
+class CellRendererSwitch(Gtk.CellRenderer):
+    """ON/OFF pill switch drawn in a TreeView cell"""
+
+    __gsignals__ = {'toggled': (GObject.SignalFlags.RUN_LAST, None, (str,))}
+    active = GObject.Property(type=bool, default=False)
+
+    WIDTH, HEIGHT = 58, 26
+
+    def __init__(self):
+        super().__init__()
+        self.set_property('mode', Gtk.CellRendererMode.ACTIVATABLE)
+        self.set_padding(6, 4)
+
+    def do_get_preferred_width(self, widget):
+        width = self.WIDTH + 2 * self.get_padding()[0]
+        return width, width
+
+    def do_get_preferred_height(self, widget):
+        height = self.HEIGHT + 2 * self.get_padding()[1]
+        return height, height
+
+    def do_render(self, cr, widget, background_area, cell_area, flags):
+        w, h = self.WIDTH, self.HEIGHT
+        x = cell_area.x + (cell_area.width - w) / 2
+        y = cell_area.y + (cell_area.height - h) / 2
+        r = h / 2
+        on = self.get_property('active')
+
+        def rgb(hex_color):
+            rgba = Gdk.RGBA()
+            rgba.parse(hex_color)
+            return rgba.red, rgba.green, rgba.blue
+
+        # Track
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -1.5708, 1.5708)
+        cr.arc(x + r, y + r, r, 1.5708, 4.7124)
+        cr.close_path()
+        cr.set_source_rgb(*rgb("#34c759" if on else "#3d424d"))
+        cr.fill()
+
+        # Label
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10)
+        text = "ON" if on else "OFF"
+        extents = cr.text_extents(text)
+        text_x = x + 8 if on else x + w - 8 - extents.width
+        cr.move_to(text_x - extents.x_bearing, y + h / 2 - extents.y_bearing - extents.height / 2)
+        cr.set_source_rgb(*rgb("#ffffff" if on else "#a0a3ad"))
+        cr.show_text(text)
+
+        # Knob
+        knob_x = x + w - r if on else x + r
+        cr.arc(knob_x, y + r, r - 3, 0, 6.2832)
+        cr.set_source_rgb(*rgb("#ececec"))
+        cr.fill()
+
+    def do_activate(self, event, widget, path, background_area, cell_area, flags):
+        self.emit('toggled', path)
+        return True
 
 
 class TunnelDialog(Gtk.Dialog):
@@ -563,7 +751,7 @@ class EasySSHTunnelApp(Gtk.Window):
 
     def __init__(self, app_indicator=None, tunnel_manager=None, config_manager=None):
         super().__init__(title=APP_NAME)
-        self.set_default_size(700, 400)
+        self.set_default_size(1100, 420)
         self.set_border_width(10)
 
         # Set window properties for taskbar appearance
@@ -636,8 +824,15 @@ class EasySSHTunnelApp(Gtk.Window):
             ("Edit", "document-edit-symbolic", "toolbar-button-neutral", self.on_edit_tunnel, None),
             ("Remove", "user-trash-symbolic", "toolbar-button-danger", self.on_remove_tunnel, None),
             None,
+            ("Start all", "media-skip-forward-symbolic", "toolbar-button-success", self.on_start_all,
+             "Start every tunnel that is not open yet"),
+            ("Stop all", "process-stop-symbolic", "toolbar-button-danger", self.on_stop_all,
+             "Stop every tunnel started by this app"),
             ("Start", "media-playback-start-symbolic", "toolbar-button-success", self.on_start_tunnel, None),
             ("Stop", "media-playback-stop-symbolic", "toolbar-button-danger", self.on_stop_tunnel, None),
+            None,
+            ("Terminal", "utilities-terminal-symbolic", "toolbar-button-neutral", self.on_open_terminal,
+             "Open an ssh session to this host in the default terminal"),
             None,
             ("Import", "document-open-symbolic", "toolbar-button-neutral", self.on_import_command,
              "Import SSH command"),
@@ -664,10 +859,19 @@ class EasySSHTunnelApp(Gtk.Window):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
-        # ListStore: name, type, ssh_host, local_port, status, config
-        self.tunnel_store = Gtk.ListStore(str, str, str, str, str, object)
+        # ListStore: name, type, ssh_host, local_port, status, status_color, message,
+        # config, switch_on
+        self.tunnel_store = Gtk.ListStore(str, str, str, str, str, str, str, object, bool)
 
         self.tunnel_view = Gtk.TreeView(model=self.tunnel_store)
+        self.tunnel_view.get_style_context().add_class("tunnel-list")
+        self.tunnel_view.connect("row-activated", self.on_row_activated)
+
+        # On/off switch per row
+        renderer = CellRendererSwitch()
+        renderer.connect("toggled", self.on_switch_toggled)
+        column = Gtk.TreeViewColumn("", renderer, active=8)
+        self.tunnel_view.append_column(column)
 
         for title, index, min_width in (("Name", 0, 120), ("Type", 1, 70),
                                         ("SSH Host", 2, 150), ("Local Port", 3, 80)):
@@ -679,9 +883,19 @@ class EasySSHTunnelApp(Gtk.Window):
 
         renderer = Gtk.CellRendererText()
         renderer.set_property("weight", Pango.Weight.BOLD)
-        column = Gtk.TreeViewColumn("Status", renderer, text=4)
-        column.set_min_width(80)
+        column = Gtk.TreeViewColumn("Status", renderer, text=4, foreground=5)
+        column.set_min_width(90)
         self.tunnel_view.append_column(column)
+
+        renderer = Gtk.CellRendererText()
+        renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+        renderer.set_property("foreground", COLOR_DIM)
+        column = Gtk.TreeViewColumn("Messages", renderer, text=6)
+        column.set_min_width(200)
+        column.set_expand(True)
+        column.set_resizable(True)
+        self.tunnel_view.append_column(column)
+        self.tunnel_view.set_tooltip_column(6)
 
         scrolled.add(self.tunnel_view)
         vbox.pack_start(scrolled, True, True, 0)
@@ -813,8 +1027,8 @@ class EasySSHTunnelApp(Gtk.Window):
             self.hide()
             return True  # Prevent window destruction
         else:
-            self.on_quit(widget)
-            return False
+            # Keep the window open when the user cancels quitting
+            return not self.on_quit(widget)
 
     def _row_values(self, config):
         forwards = config.get('forwards', [])
@@ -825,13 +1039,16 @@ class EasySSHTunnelApp(Gtk.Window):
             local_port = config.get('local_port', '-')
         user = config.get('ssh_user')
         ssh_host = f"{user}@{config.get('ssh_host')}" if user else config.get('ssh_host', '')
-        status = "Running" if self.tunnel_manager.is_running(config.get('id')) else "Stopped"
+        status, status_color, message = self.tunnel_manager.status(config)
         return [config.get('name', ''),
                 config.get('type', 'local').capitalize(),
                 ssh_host,
                 local_port,
                 status,
-                config]
+                status_color,
+                message,
+                config,
+                status in ON_STATUSES]
 
     def refresh_tunnel_list(self):
         """Refresh the tunnel list view, keeping the selection"""
@@ -844,16 +1061,19 @@ class EasySSHTunnelApp(Gtk.Window):
                 self.tunnel_view.get_selection().select_iter(treeiter)
 
     def update_status(self):
-        """Update tunnel status in the list"""
+        """Update tunnel status and messages in the list"""
         for row in self.tunnel_store:
-            row[4] = "Running" if self.tunnel_manager.is_running(row[5].get('id')) else "Stopped"
+            status, status_color, message = self.tunnel_manager.status(row[7])
+            switch_on = status in ON_STATUSES
+            if (row[4], row[5], row[6], row[8]) != (status, status_color, message, switch_on):
+                row[4], row[5], row[6], row[8] = status, status_color, message, switch_on
         return True
 
     def _selected_config(self):
         if not hasattr(self, 'tunnel_view'):
             return None
         model, treeiter = self.tunnel_view.get_selection().get_selected()
-        return model[treeiter][5] if treeiter else None
+        return model[treeiter][7] if treeiter else None
 
     def _tunnels_changed(self):
         self.config_manager.save_tunnels(self.tunnels_config)
@@ -861,6 +1081,21 @@ class EasySSHTunnelApp(Gtk.Window):
             self.app_indicator.update_menu()
         else:
             self.refresh_tunnel_list()
+
+    def on_switch_toggled(self, renderer, path):
+        """Switch in the list starts or stops that row's tunnel"""
+        self.tunnel_view.get_selection().select_path(path)
+        if self.tunnel_store[path][8]:
+            self.on_stop_tunnel(None)
+        else:
+            self.on_start_tunnel(None)
+
+    def on_row_activated(self, view, path, column):
+        """Double-click toggles a tunnel"""
+        if self.tunnel_store[path][8]:
+            self.on_stop_tunnel(None)
+        else:
+            self.on_start_tunnel(None)
 
     def on_add_tunnel(self, widget, prefill=None):
         """Add a new tunnel configuration"""
@@ -900,6 +1135,7 @@ class EasySSHTunnelApp(Gtk.Window):
                     if c.get('id') == tunnel_id:
                         self.tunnels_config[i] = new_data
                         break
+                self.tunnel_manager.scanner._stamp = 0.0
                 if was_running:
                     self.tunnel_manager.start_tunnel(tunnel_id, new_data)
                 self._tunnels_changed()
@@ -930,10 +1166,10 @@ class EasySSHTunnelApp(Gtk.Window):
             self.show_error("Please select a tunnel to start")
             return
         success, message = self.tunnel_manager.start_tunnel(config.get('id'), config)
-        if not success:
-            self.show_error(f"Failed to start tunnel: {message}")
-            return
-        self.show_message(f"Tunnel '{config.get('name')}' started")
+        if success:
+            self.show_message(f"Tunnel '{config.get('name')}' started")
+        else:
+            self.show_message(f"Tunnel '{config.get('name')}' not started: {message}")
         self.update_status()
         if self.app_indicator:
             self.app_indicator.update_menu_status()
@@ -944,14 +1180,60 @@ class EasySSHTunnelApp(Gtk.Window):
         if not config:
             self.show_error("Please select a tunnel to stop")
             return
-        success, message = self.tunnel_manager.stop_tunnel(config.get('id'))
-        if not success:
-            self.show_error(message)
-            return
-        self.show_message(f"Tunnel '{config.get('name')}' stopped")
+        tunnel_id = config.get('id')
+        if self.tunnel_manager.is_running(tunnel_id):
+            self.tunnel_manager.stop_tunnel(tunnel_id)
+            self.show_message(f"Tunnel '{config.get('name')}' stopped")
+        else:
+            self.tunnel_manager.stop_tunnel(tunnel_id)
+            self.show_message(f"Tunnel '{config.get('name')}' is offline")
+        self.tunnel_manager.scanner._stamp = 0.0
         self.update_status()
         if self.app_indicator:
             self.app_indicator.update_menu_status()
+
+    def on_start_all(self, widget):
+        started = 0
+        for config in self.tunnels_config:
+            tunnel_id = config.get('id')
+            if self.tunnel_manager.status(config)[0] in ON_STATUSES:
+                continue
+            if self.tunnel_manager.start_tunnel(tunnel_id, config)[0]:
+                started += 1
+        self.show_message(f"Started {started} tunnel(s)")
+        self.update_status()
+        if self.app_indicator:
+            self.app_indicator.update_menu_status()
+
+    def on_stop_all(self, widget):
+        for config in self.tunnels_config:
+            self.tunnel_manager.stop_tunnel(config.get('id'))
+        self.tunnel_manager.scanner._stamp = 0.0
+        self.show_message("Stopped all tunnels started by this app")
+        self.update_status()
+        if self.app_indicator:
+            self.app_indicator.update_menu_status()
+
+    def on_open_terminal(self, widget):
+        """Open an interactive ssh session to the tunnel's host in the default terminal"""
+        config = self._selected_config()
+        if not config:
+            self.show_error("Please select a tunnel")
+            return
+        cmd = ['ssh']
+        if config.get('ssh_port'):
+            cmd += ['-p', str(config['ssh_port'])]
+        user = config.get('ssh_user')
+        cmd.append(f"{user}@{config['ssh_host']}" if user else config['ssh_host'])
+        try:
+            launcher = subprocess.Popen(terminal_command() + cmd, start_new_session=True,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+            # Reap the launcher so it does not linger as a zombie
+            threading.Thread(target=launcher.wait, daemon=True).start()
+            self.show_message(f"Opened {' '.join(cmd)} in terminal")
+        except OSError as e:
+            self.show_error(f"Could not open terminal: {e}")
 
     def on_import_command(self, widget):
         """Import SSH commands (supports multiple commands, one per line)"""
@@ -1259,10 +1541,33 @@ class EasySSHTunnelApp(Gtk.Window):
         dialog.run()
         dialog.destroy()
 
+    def confirm_quit(self):
+        """Ask before quitting while tunnels run, since quitting stops them"""
+        running = [c.get('name', '') for c in self.tunnels_config
+                   if self.tunnel_manager.is_running(c.get('id'))]
+        if not running:
+            return True
+        dialog = Gtk.MessageDialog(
+            parent=self if self.get_visible() else None, flags=0,
+            message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.NONE,
+            text=f"Quit and stop {len(running)} running tunnel(s)?")
+        dialog.format_secondary_text(
+            "Quitting closes every tunnel started by this app:\n" + "\n".join(running))
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                           "Quit and stop tunnels", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        dialog.set_keep_above(True)
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.OK
+
     def on_quit(self, widget):
-        """Cleanup and quit"""
+        """Stop all tunnels and quit, after confirmation; returns False when cancelled"""
+        if not self.confirm_quit():
+            return False
         self.tunnel_manager.cleanup()
         Gtk.main_quit()
+        return True
 
 
 class SSHTunnelIndicator:
@@ -1321,10 +1626,14 @@ class SSHTunnelIndicator:
         # Update menu and icon periodically to refresh status
         GLib.timeout_add_seconds(2, self.update_menu_status)
 
+    STATUS_EMOJI = {"Running": "🟢", "Connecting": "🟡", "Stopped": "🔴", "Offline": "⚪"}
+
     def _menu_label(self, config):
-        """(running, label); green dot for connected, red dot for disconnected"""
-        running = self.tunnel_manager.is_running(config.get('id'))
-        return running, f"{'🟢' if running else '🔴'} {config.get('name', 'Unknown')}"
+        """(status, label); the label starts with the status emoji"""
+        status = self.tunnel_manager.status(config)[0]
+        port = tunnel_port(config)
+        label = f"{self.STATUS_EMOJI.get(status, '⚪')}  {config.get('name', 'Unknown')}"
+        return status, (f"{label}  :{port}" if port else label)
 
     def build_menu(self):
         """Build the indicator menu"""
@@ -1374,8 +1683,8 @@ class SSHTunnelIndicator:
         """Update menu status indicators periodically without rebuilding menu"""
         any_running = False
         for menu_item, config in getattr(self, 'tunnel_menu_items', {}).values():
-            running, label_text = self._menu_label(config)
-            if running:
+            status, label_text = self._menu_label(config)
+            if status in ON_STATUSES:
                 any_running = True
             if menu_item.get_label() != label_text:
                 menu_item.set_label(label_text)
@@ -1397,6 +1706,7 @@ class SSHTunnelIndicator:
             self.tunnel_manager.stop_tunnel(tunnel_id)
         else:
             self.tunnel_manager.start_tunnel(tunnel_id, config)
+        self.tunnel_manager.scanner._stamp = 0.0
         self.window.update_status()
         self.update_menu_status()
 
@@ -1409,9 +1719,8 @@ class SSHTunnelIndicator:
         self.window.set_keep_above(False)  # Ensure it's a normal window
 
     def quit_app(self, widget):
-        """Quit the application"""
-        self.tunnel_manager.cleanup()
-        Gtk.main_quit()
+        """Quit the application; asks first when tunnels are running"""
+        self.window.on_quit(widget)
 
 
 def main():
